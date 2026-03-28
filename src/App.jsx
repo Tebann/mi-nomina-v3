@@ -1,7 +1,9 @@
 // App.jsx
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import jsPDF from "jspdf";
 import logoSrc from "./assets/logo.png";
+import { hasFirebaseConfig } from "./lib/firebase";
+import { loadCloudData, saveCloudData, signInWithGoogle, signOutGoogle, watchAuth } from "./lib/cloudStore";
 
 /*
   App.jsx - Versión actualizada
@@ -13,6 +15,7 @@ import logoSrc from "./assets/logo.png";
 */
 
 const ALL_KEY = "miNomina_v2";
+const CLOUD_MIGRATION_PREFIX = "miNomina_cloud_migrated_";
 const BACKUP_PREFIX = `${ALL_KEY}_backup_`;
 const MONTHS_ES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
 const DAYS_SHORT = ["Dom","Lun","Mar","Mié","Jue","Vie","Sáb"];
@@ -281,8 +284,86 @@ function saveAll(x){ localStorage.setItem(ALL_KEY, JSON.stringify(x)); }
 // ------------------ APP ------------------
 export default function App(){
   const [all, setAll] = useState(loadAll);
-  const [view, setView] = useState('app'); // app | profile | login
+  const [view, setView] = useState('app'); // app | profile
+  const [googleUser, setGoogleUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [cloudReady, setCloudReady] = useState(false);
+  const [authErr, setAuthErr] = useState('');
+  const lastCloudSnapshotRef = useRef('');
+
   useEffect(()=> saveAll(all), [all]);
+
+  useEffect(()=>{
+    if(!hasFirebaseConfig){
+      setAuthReady(true);
+      setCloudReady(false);
+      return;
+    }
+
+    const unsub = watchAuth(async(user)=>{
+      setGoogleUser(user);
+      setAuthReady(true);
+      setAuthErr('');
+
+      if(!user){
+        setCloudReady(false);
+        return;
+      }
+
+      try{
+        const localAll = loadAll();
+        const cloudAll = await loadCloudData(user.uid);
+        let next = cloudAll ? migrateAllData(cloudAll).data : migrateAllData(localAll).data;
+
+        if(!cloudAll){
+          if(!next.users.length){
+            const seeded = defaultUser(user.email || '', 'GOOGLE');
+            next = { users:[seeded], currentUserId: seeded.id };
+          } else if(!next.currentUserId){
+            const byEmail = next.users.find(u => (u.email || '').toLowerCase() === (user.email || '').toLowerCase());
+            next = { ...next, currentUserId: byEmail?.id || next.users[0]?.id || null };
+          }
+          await saveCloudData(user.uid, next);
+          try{ localStorage.setItem(`${CLOUD_MIGRATION_PREFIX}${user.uid}`, '1'); }catch(_){ }
+        }
+
+        if(user.email){
+          const existing = next.users.find(u => (u.email || '').toLowerCase() === user.email.toLowerCase());
+          if(existing){
+            next = { ...next, currentUserId: existing.id };
+          } else {
+            const seeded = defaultUser(user.email, 'GOOGLE');
+            next = { ...next, users:[...next.users, seeded], currentUserId: seeded.id };
+            await saveCloudData(user.uid, next);
+          }
+        }
+
+        setAll(next);
+        lastCloudSnapshotRef.current = JSON.stringify(next);
+        setCloudReady(true);
+      }catch(e){
+        setAuthErr('No se pudo sincronizar con la nube. Verifica tu configuración de Firebase.');
+        setCloudReady(false);
+      }
+    });
+
+    return ()=> unsub && unsub();
+  }, []);
+
+  useEffect(()=>{
+    if(!hasFirebaseConfig || !googleUser || !cloudReady) return;
+    const serialized = JSON.stringify(all);
+    if(serialized === lastCloudSnapshotRef.current) return;
+
+    const timer = setTimeout(async()=>{
+      try{
+        await saveCloudData(googleUser.uid, all);
+        lastCloudSnapshotRef.current = serialized;
+      }catch(_){ }
+    }, 500);
+
+    return ()=> clearTimeout(timer);
+  }, [all, cloudReady, googleUser]);
 
   function replaceUser(newUser){
     setAll(s=>{
@@ -301,25 +382,37 @@ export default function App(){
     });
   }
 
-  function registerAndLogin(email, password){ setAll(s=> { const u = defaultUser(email,password); return { ...s, users:[...s.users,u], currentUserId: u.id }; }); setView('app'); }
-  function loginWith(email,password){ setAll(s=> { const f = s.users.find(u => u.email === email && u.password === password); if(!f) return s; return { ...s, currentUserId: f.id }; }); setView('app'); }
-
   const currentUser = all.users.find(u => u.id === all.currentUserId) || null;
 
-  if(!currentUser || view === 'login') return <AuthScreen onLogin={loginWith} onRegister={registerAndLogin} />;
+  async function handleGoogleLogin(){
+    try{
+      setAuthErr('');
+      await signInWithGoogle();
+    }catch(e){
+      setAuthErr('No se pudo iniciar sesión con Google.');
+    }
+  }
+
+  async function handleLogout(){
+    try{
+      await signOutGoogle();
+      setView('app');
+      setAll({ users:[], currentUserId:null });
+    }catch(_){ }
+  }
+
+  if(!hasFirebaseConfig) return <GoogleAuthScreen disabled message="Falta configurar Firebase. Crea un archivo .env con tus llaves y reinicia la app." onGoogleLogin={handleGoogleLogin} error={authErr} />;
+  if(!authReady) return <LoadingScreen text="Preparando autenticación..." />;
+  if(!googleUser) return <GoogleAuthScreen onGoogleLogin={handleGoogleLogin} error={authErr} />;
+  if(!cloudReady) return <LoadingScreen text="Sincronizando tus datos..." />;
+  if(!currentUser) return <LoadingScreen text="Preparando tu perfil..." />;
   if(view === 'profile') return <Usuario user={currentUser} onSave={(profile)=>{ patchCurrentUser({ profile }); setView('app'); }} onCancel={()=> setView('app')} />;
 
-  return <MainApp user={currentUser} replaceUser={replaceUser} patchCurrentUser={patchCurrentUser} onLogout={()=> setAll(s=> ({ ...s, currentUserId:null }))} goProfile={()=> setView('profile')} />;
+  return <MainApp user={currentUser} replaceUser={replaceUser} patchCurrentUser={patchCurrentUser} onLogout={handleLogout} goProfile={()=> setView('profile')} />;
 }
 
 // ------------------ AUTH ------------------
-function AuthScreen({ onLogin, onRegister }){
-  const [mode, setMode] = useState('login');
-  const [email,setEmail]=useState('');
-  const [password,setPassword]=useState('');
-  const [err,setErr]=useState('');
-  function doLogin(){ if(!email||!password) return setErr('Completa correo y contraseña'); onLogin(email,password); }
-  function doRegister(){ if(!email||!password) return setErr('Completa correo y contraseña'); onRegister(email,password); }
+function GoogleAuthScreen({ onGoogleLogin, error, disabled = false, message = '' }){
   return (
     <div className="min-h-screen bg-[#F6F2EA] p-4 md:p-8 flex items-center justify-center">
       <div className="max-w-md w-full bg-white rounded-2xl p-6 shadow-[0_10px_30px_rgba(0,0,0,0.08)] border border-slate-200">
@@ -333,21 +426,23 @@ function AuthScreen({ onLogin, onRegister }){
           <h1 className="text-2xl font-extrabold tracking-tight">Mi Nómina</h1>
         </div>
 
-        <div className="flex justify-center gap-2 mb-4">
-          <button className={`px-3 py-1 rounded-lg border border-slate-300 ${mode==='login'?'bg-black text-white':''}`} onClick={()=>{setMode('login');setErr('');}}>Iniciar sesión</button>
-          <button className={`px-3 py-1 rounded-lg border border-slate-300 ${mode==='register'?'bg-black text-white':''}`} onClick={()=>{setMode('register');setErr('');}}>Crear cuenta</button>
-        </div>
-
         <div className="space-y-3">
-          <input className="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="Correo" value={email} onChange={e=> setEmail(e.target.value)} />
-          <input className="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="Contraseña" type="password" value={password} onChange={e=> setPassword(e.target.value)} />
-          {err && <div className="text-red-600 text-xs text-center">{err}</div>}
-          {mode==='login'
-            ? <button className="w-full bg-slate-900 text-white rounded-xl py-2.5 font-semibold shadow hover:bg-slate-800" onClick={doLogin}>Entrar</button>
-            : <button className="w-full bg-slate-900 text-white rounded-xl py-2.5 font-semibold shadow hover:bg-slate-800" onClick={doRegister}>Registrarme</button>}
+          {message && <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">{message}</div>}
+          {error && <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-900">{error}</div>}
+          <button disabled={disabled} className="w-full bg-slate-900 text-white rounded-xl py-2.5 font-semibold shadow hover:bg-slate-800 disabled:opacity-60 disabled:cursor-not-allowed" onClick={onGoogleLogin}>Continuar con Google</button>
         </div>
 
-        <p className="text-xs opacity-60 mt-3 text-center">* Datos guardados solo en este dispositivo.</p>
+        <p className="text-xs opacity-60 mt-3 text-center">Tus datos se sincronizan con tu cuenta de Google en la nube.</p>
+      </div>
+    </div>
+  );
+}
+
+function LoadingScreen({ text }){
+  return (
+    <div className="min-h-screen bg-[#F6F2EA] p-4 md:p-8 flex items-center justify-center">
+      <div className="max-w-md w-full bg-white rounded-2xl p-6 shadow-[0_10px_30px_rgba(0,0,0,0.08)] border border-slate-200 text-center">
+        <div className="text-sm opacity-70">{text || 'Cargando...'}</div>
       </div>
     </div>
   );
