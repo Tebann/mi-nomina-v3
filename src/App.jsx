@@ -283,13 +283,16 @@ function saveAll(x){ localStorage.setItem(ALL_KEY, JSON.stringify(x)); }
 
 function mapAuthError(err){
   const code = err?.code || '';
+  const message = err?.message || '';
   if(code === 'auth/unauthorized-domain') return 'Dominio no autorizado en Firebase Auth. Agrega localhost y tebann.github.io en Authorized domains.';
   if(code === 'auth/operation-not-allowed') return 'Google no está habilitado en Firebase Authentication > Sign-in method.';
+  if(code === 'auth/invalid-api-key' || code.includes('api-key-not-valid')) return 'API key inválida para Firebase Auth. Revisa VITE_FIREBASE_API_KEY en .env y en GitHub Secrets.';
   if(code === 'auth/popup-blocked') return 'El navegador bloqueó la ventana emergente. Habilita popups para este sitio.';
   if(code === 'auth/popup-closed-by-user') return 'Cerraste la ventana de inicio de sesión antes de completar el acceso.';
   if(code === 'auth/cancelled-popup-request') return 'Ya hay una solicitud de login en curso. Intenta de nuevo.';
   if(code === 'auth/network-request-failed') return 'Fallo de red al conectar con Firebase. Revisa tu conexión.';
-  return `No se pudo iniciar sesión con Google.${code ? ` (${code})` : ''}`;
+  if(code || message) return `No se pudo iniciar sesión con Google. ${code ? `Código: ${code}. ` : ''}${message ? `Detalle: ${message}` : ''}`;
+  return 'No se pudo iniciar sesión con Google.';
 }
 
 function mapCloudSyncError(err){
@@ -360,6 +363,7 @@ export default function App(){
         lastCloudSnapshotRef.current = JSON.stringify(next);
         setCloudReady(true);
       }catch(e){
+        try{ console.error('Cloud sync error:', e); }catch(_){ }
         setAuthErr(mapCloudSyncError(e));
         setCloudReady(false);
       }
@@ -407,6 +411,7 @@ export default function App(){
       setAuthErr('');
       await signInWithGoogle();
     }catch(e){
+      try{ console.error('Google auth error:', e); }catch(_){ }
       setAuthErr(mapAuthError(e));
     }
   }

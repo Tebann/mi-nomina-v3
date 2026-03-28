@@ -1,4 +1,4 @@
-import { signInWithPopup, onAuthStateChanged, signOut } from 'firebase/auth';
+import { signInWithPopup, signInWithRedirect, onAuthStateChanged, signOut } from 'firebase/auth';
 import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
 import { auth, db, googleProvider, hasFirebaseConfig } from './firebase';
 
@@ -9,8 +9,16 @@ export async function signInWithGoogle() {
   if (!hasFirebaseConfig || !auth || !googleProvider) {
     throw new Error('Firebase no está configurado.');
   }
-  const res = await signInWithPopup(auth, googleProvider);
-  return res.user;
+  try {
+    const res = await signInWithPopup(auth, googleProvider);
+    return res.user;
+  } catch (e) {
+    if (e?.code === 'auth/popup-blocked' || e?.code === 'auth/cancelled-popup-request') {
+      await signInWithRedirect(auth, googleProvider);
+      return null;
+    }
+    throw e;
+  }
 }
 
 export function watchAuth(callback) {
