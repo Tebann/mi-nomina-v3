@@ -20,8 +20,14 @@ const BACKUP_PREFIX = `${ALL_KEY}_backup_`;
 const MONTHS_ES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
 const DAYS_SHORT = ["Dom","Lun","Mar","Mié","Jue","Vie","Sáb"];
 const currency = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 });
+const compactNumber = new Intl.NumberFormat("es-CO", { notation: "compact", maximumFractionDigits: 1 });
 
 function fmtMoney(n){ return currency.format(Math.round(n||0)); }
+function fmtMoneyCompact(n){
+  const x = Math.round(n || 0);
+  if (Math.abs(x) < 1000) return fmtMoney(x);
+  return `$${compactNumber.format(x)}`;
+}
 function ymd(d = new Date()){ return new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString().slice(0,10); }
 function monthKey(y,m){ const mm = (m+1).toString().padStart(2,'0'); return `${y}-${mm}`; }
 function startOfMonth(y,m){ return new Date(y,m,1); }
@@ -921,7 +927,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
       <section className="max-w-6xl mx-auto mb-6">
         <div className="rounded-2xl border border-slate-200 bg-white p-4 grid grid-cols-1 sm:grid-cols-4 gap-3 items-center shadow-[0_10px_30px_rgba(0,0,0,0.06)]">
           <div className="col-span-1 sm:col-span-1">
-            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(16,185,129,0.06)]" style={{ background: '#ECFDF3' }}>
+            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(16,185,129,0.06)] text-center sm:text-left" style={{ background: '#ECFDF3' }}>
               <div className="text-sm opacity-70">Ingresos</div>
               <div className="text-2xl font-extrabold tracking-tight text-emerald-700">{fmtMoney(ingresos)}</div>
               <div className="text-xs opacity-60">{monthWorkDays.length} días</div>
@@ -929,7 +935,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
           </div>
 
           <div className="col-span-1 sm:col-span-1">
-            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(239,68,68,0.04)]" style={{ background: '#FEF2F2' }}>
+            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(239,68,68,0.04)] text-center sm:text-left" style={{ background: '#FEF2F2' }}>
               <div className="text-sm opacity-70">Gastos</div>
               <div className="text-2xl font-extrabold tracking-tight text-rose-700">{fmtMoney(gastos)}</div>
               <div className="text-xs opacity-60">{monthExpenses.length} gastos</div>
@@ -937,7 +943,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
           </div>
 
           <div className="col-span-1 sm:col-span-1">
-            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(59,130,246,0.04)]" style={{ background: '#EFF6FF' }}>
+            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(59,130,246,0.04)] text-center sm:text-left" style={{ background: '#EFF6FF' }}>
               <div className="text-sm opacity-70">Balance</div>
               <div className="text-2xl font-extrabold tracking-tight text-sky-700">{fmtMoney(balance)}</div>
               <div className="text-xs opacity-60">{balance>=0 ? 'Ahorro' : 'Déficit'}</div>
@@ -953,7 +959,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
         </div>
       </section>
 
-      <main className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <main className="max-w-6xl mx-auto grid grid-cols-1 gap-6">
         <section className="space-y-6">
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-[0_8px_24px_rgba(0,0,0,0.06)]">
             <div className="flex items-center justify-between mb-3">
@@ -985,9 +991,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
               }}
             />
           </div>
-        </section>
 
-        <section className="space-y-6">
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-[0_8px_24px_rgba(0,0,0,0.06)]">
             <div className="flex items-center justify-between mb-2">
               <div className="text-lg font-bold">Gastos del mes</div>
@@ -1005,87 +1009,142 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
 
                 const Section = ({ title, items, titleBg }) => {
                   const total = items.reduce((s, it) => s + (sanitizeAmount(it.amount) || 0), 0);
+                  const isMobile = window.innerWidth < 768;
+                  
                   return (
-                      <div className="rounded-lg border border-slate-200 overflow-hidden">
-                        <div className={`px-4 py-2 text-sm font-bold leading-tight text-center ${titleBg} text-white`}>{title}</div>
-                      <div className="bg-white">
-                        <table className="w-full table-fixed">
-                          <thead>
-                            <tr className="text-sm text-left">
-                              <th className="px-4 py-2 w-1/2">Concepto</th>
-                              <th className="px-4 py-2 w-1/4 text-right">Precio</th>
-                              <th className="px-4 py-2 w-1/4 text-center">Acciones</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {items.map(e => (
-                              <tr key={e.id} className={`border-t ${e.paid ? 'bg-emerald-50' : ''}`}>
-                                <td className={`px-3 py-2 align-middle min-w-0 ${e.paid ? 'text-emerald-800' : ''}`}>
-                                    <div className="flex flex-col min-w-0">
-                                      <div className="text-sm font-semibold truncate">{e.concept}</div>
-                                      {/* Construye el string usando la fecha formateada y la información */}
-                                      {(e.cutoffDate || e.info) && (
-                                        <div className="text-xs opacity-60 truncate mt-0.5">
-                                          {[
-                                            e.cutoffDate ? formatTextDate(e.cutoffDate) : '', 
-                                            e.info
-                                          ].filter(Boolean).join(' - ')}
-                                        </div>
-                                      )}
+                    <div className="rounded-lg border border-slate-200 overflow-hidden">
+                      <div className={`px-4 py-2 text-sm font-bold leading-tight text-center ${titleBg} text-white`}>{title}</div>
+                      {!isMobile ? (
+                        // Vista de tabla para desktop
+                        <div className="bg-white overflow-x-auto">
+                          <table className="w-full table-fixed min-w-[620px] sm:min-w-0">
+                            <thead>
+                              <tr className="text-sm text-left">
+                                <th className="px-4 py-2 w-1/2">Concepto</th>
+                                <th className="px-4 py-2 w-1/4 text-right">Precio</th>
+                                <th className="px-4 py-2 w-1/4 text-center">Acciones</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {items.map(e => (
+                                <tr key={e.id} className={`border-t ${e.paid ? 'bg-emerald-50' : ''}`}>
+                                  <td className={`px-3 py-2 align-middle min-w-0 ${e.paid ? 'text-emerald-800' : ''}`}>
+                                      <div className="flex flex-col min-w-0">
+                                        <div className="text-sm font-semibold truncate">{e.concept}</div>
+                                        {(e.cutoffDate || e.info) && (
+                                          <div className="text-xs opacity-60 truncate mt-0.5">
+                                            {[
+                                              e.cutoffDate ? formatTextDate(e.cutoffDate) : '', 
+                                              e.info
+                                            ].filter(Boolean).join(' - ')}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </td>
+                                  <td className={`px-3 py-2 align-middle text-right text-sm whitespace-nowrap ${e.paid ? 'text-emerald-800' : ''}`}>{fmtMoney(e.amount)}</td>
+                                  <td className="px-4 py-3 align-middle text-center overflow-visible">
+                                    <div className="flex items-center justify-center gap-2 whitespace-nowrap">
+                                      <button title={"Pago"} aria-label="marcar-pagado" onClick={()=> toggleExpensePaid(e.id)} className={("w-7 h-7 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 "+(e.paid ? "bg-green-100 border-green-300":"bg-white border-slate-300"))}>
+                                        {e.paid ? (
+                                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-green-700">
+                                            <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                          </svg>
+                                        ) : (
+                                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-slate-700">
+                                            <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                          </svg>
+                                        )}
+                                      </button>
+                                      <button title="Editar" aria-label="editar" onClick={()=> { setExpenseToEdit(e); setShowExpenseModal(true); }} className="w-7 h-7 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-blue-50 hover:border-blue-200 transition text-blue-600 font-semibold">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-blue-600">
+                                          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                        </svg>
+                                      </button>
+                                      <button title="Eliminar" aria-label="eliminar" onClick={()=> deleteExpense(e.id)} className="w-7 h-7 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-rose-50 hover:border-rose-200 transition text-rose-600 font-semibold">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-rose-600">
+                                          <path d="M18 6L6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                          <path d="M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                        </svg>
+                                      </button>
                                     </div>
                                   </td>
-                                <td className={`px-3 py-2 align-middle text-right text-sm whitespace-nowrap ${e.paid ? 'text-emerald-800' : ''}`}>{fmtMoney(e.amount)}</td>
-                                <td className="px-4 py-3 align-middle text-center overflow-hidden">
-                                  <div className="flex items-center justify-center gap-2 whitespace-nowrap">
-                                    
-                                    {/* Botón de Pagar (se mantiene igual) */}
-                                    <button title={"Pago"} aria-label="marcar-pagado" onClick={()=> toggleExpensePaid(e.id)} className={("w-7 h-7 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 "+(e.paid ? "bg-green-100 border-green-300":"bg-white border-slate-300"))}>
-                                      {e.paid ? (
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-green-700">
-                                          <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                        </svg>
-                                      ) : (
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-slate-700">
-                                          <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                        </svg>
-                                      )}
-                                    </button>
-
-                                    {/* NUEVO: Botón de Editar */}
-                                    <button title="Editar" aria-label="editar" onClick={()=> { setExpenseToEdit(e); setShowExpenseModal(true); }} className="w-7 h-7 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-blue-50 hover:border-blue-200 transition text-blue-600 font-semibold">
-                                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-blue-600">
-                                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                      </svg>
-                                    </button>
-
-                                    {/* Botón de Eliminar (se mantiene igual) */}
-                                    <button title="Eliminar" aria-label="eliminar" onClick={()=> deleteExpense(e.id)} className="w-7 h-7 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-rose-50 hover:border-rose-200 transition text-rose-600 font-semibold">
-                                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-rose-600">
-                                        <path d="M18 6L6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                        <path d="M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                      </svg>
-                                    </button>
-                                    
-                                  </div>
-                                </td>
+                                </tr>
+                              ))}
+                              {items.length===0 && (
+                                <tr>
+                                  <td colSpan={3} className="px-4 py-3 text-sm opacity-60">No hay registros en esta categoría.</td>
+                                </tr>
+                              )}
+                            </tbody>
+                            <tfoot>
+                              <tr className="text-sm font-semibold bg-slate-50">
+                                <td className="px-4 py-2">Total</td>
+                                <td className="px-4 py-2 text-right">{fmtMoney(total)}</td>
+                                <td className="px-4 py-2" />
                               </tr>
-                            ))}
-                            {items.length===0 && (
-                              <tr>
-                                <td colSpan={3} className="px-4 py-3 text-sm opacity-60">No hay registros en esta categoría.</td>
-                              </tr>
-                            )}
-                          </tbody>
-                          <tfoot>
-                            <tr className="text-sm font-semibold bg-slate-50">
-                              <td className="px-4 py-2">Total</td>
-                              <td className="px-4 py-2 text-right">{fmtMoney(total)}</td>
-                              <td className="px-4 py-2" />
-                            </tr>
-                          </tfoot>
-                        </table>
-                      </div>
+                            </tfoot>
+                          </table>
+                        </div>
+                      ) : (
+                        // Vista de cards para móvil
+                        <div className="bg-white space-y-2 p-3">
+                          {items.map(e => (
+                            <div key={e.id} className={`rounded-lg border p-3 flex flex-col ${e.paid ? 'bg-emerald-50 border-emerald-200' : 'bg-white border-slate-200'}`}>
+                              <div className="flex items-start justify-between mb-2">
+                                <div className="flex-1 min-w-0">
+                                  <div className={`font-semibold text-sm truncate ${e.paid ? 'text-emerald-800' : ''}`}>{e.concept}</div>
+                                  {(e.cutoffDate || e.info) && (
+                                    <div className={`text-xs opacity-60 truncate mt-1 ${e.paid ? 'text-emerald-700' : ''}`}>
+                                      {[
+                                        e.cutoffDate ? formatTextDate(e.cutoffDate) : '', 
+                                        e.info
+                                      ].filter(Boolean).join(' - ')}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                              <div className="flex items-center justify-between">
+                                <div className={`text-lg font-bold ${e.paid ? 'text-emerald-700' : ''}`}>{fmtMoney(e.amount)}</div>
+                                <div className="flex gap-1.5">
+                                  <button title={"Pago"} aria-label="marcar-pagado" onClick={()=> toggleExpensePaid(e.id)} className={("w-6 h-6 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 text-xs "+(e.paid ? "bg-green-100 border-green-300":"bg-white border-slate-300"))}>
+                                    {e.paid ? (
+                                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-green-700">
+                                        <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                      </svg>
+                                    ) : (
+                                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-slate-700">
+                                        <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                      </svg>
+                                    )}
+                                  </button>
+                                  <button title="Editar" aria-label="editar" onClick={()=> { setExpenseToEdit(e); setShowExpenseModal(true); }} className="w-6 h-6 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-blue-50 hover:border-blue-200 transition text-blue-600">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-blue-600">
+                                      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                    </svg>
+                                  </button>
+                                  <button title="Eliminar" aria-label="eliminar" onClick={()=> deleteExpense(e.id)} className="w-6 h-6 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-rose-50 hover:border-rose-200 transition text-rose-600">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-rose-600">
+                                      <path d="M18 6L6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                      <path d="M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                    </svg>
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                          {items.length===0 && (
+                            <div className="px-3 py-2 text-sm opacity-60 text-center">No hay registros en esta categoría.</div>
+                          )}
+                          <div className="border-t border-slate-200 pt-3 mt-3">
+                            <div className="flex items-center justify-between text-sm font-semibold">
+                              <span>Total</span>
+                              <span>{fmtMoney(total)}</span>
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   );
                 };
@@ -1100,7 +1159,6 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
               })()}
             </div>
           </div>
-          
         </section>
       </main>
 
@@ -1201,13 +1259,15 @@ function CalendarCell({ date, month, user, onOpenDetail }){
   const showIndicators = indicators.slice(0,4);
   const dayIncome = workDays.reduce((acc,w)=> { const t = user.dayTypes.find(dt => dt.id === w.typeId); return acc + (t ? t.rate : (w.value||0)); }, 0);
   return (
-    <div role="button" tabIndex={0} onKeyDown={(e)=> { if(e.key==='Enter'||e.key===' ') onOpenDetail(key); }} onClick={()=> onOpenDetail(key)} className={`h-20 rounded-xl border bg-white p-2 flex flex-col justify-between ${isOtherMonth? 'opacity-40':''} cursor-pointer shadow-sm`}>
+    <div role="button" tabIndex={0} onKeyDown={(e)=> { if(e.key==='Enter'||e.key===' ') onOpenDetail(key); }} onClick={()=> onOpenDetail(key)} className={`h-20 rounded-xl border bg-white p-2 flex flex-col justify-between ${isOtherMonth? 'opacity-40':''} cursor-pointer shadow-sm hover:shadow-md hover:border-slate-400 transition`}>
       <div className="flex items-center justify-between">
-        <div className="text-xs font-semibold">{date.getDate()}</div>
-        <div className="flex gap-1">{showIndicators.map((c,i)=> <span key={i} className="w-3 h-3 rounded-sm border" style={{ background: c }} />)}</div>
+        <div className="text-xs font-semibold opacity-0">{date.getDate()}</div>
+        <div className="flex gap-1">{showIndicators.map((c,i)=> <span key={i} className="w-3 h-3 rounded-sm border border-slate-200" style={{ background: c }} />)}</div>
       </div>
       <div className="flex items-end justify-between">
-        {dayIncome>0 ? <div className="text-[11px] font-semibold">{fmtMoney(dayIncome)}</div> : <div className="text-[11px] opacity-50"> </div>}
+        {dayIncome>0 ? (
+          <div className="text-[10px] font-semibold opacity-60">{fmtMoneyCompact(dayIncome)}</div>
+        ) : <div className="text-xs opacity-50"> </div>}
         <div className="text-xs opacity-60">&nbsp;</div>
       </div>
     </div>
@@ -1400,7 +1460,7 @@ function LoanProfilesManager({ profiles, selectedProfileId, onAddEntry, onAbonar
   const selectedTotal = selectedEntries.reduce((a,b)=> a + (Number(b.amount) || 0), 0);
 
   return (
-    <div className="space-y-4 text-sm">
+    <div className="space-y-4 text-sm max-h-[70vh] overflow-y-auto">
       <div className="space-y-3">
         <div className="rounded-xl border border-slate-200 p-3 bg-white">
           <div className="flex items-center justify-between mb-3">
@@ -1411,17 +1471,17 @@ function LoanProfilesManager({ profiles, selectedProfileId, onAddEntry, onAbonar
           {!selected && <div className="text-xs opacity-60">Vuelve al dashboard y abre un perfil haciendo clic en su tarjeta.</div>}
 
           {selected && (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 auto-rows-max">
               <div className="space-y-3">
                 <div className="rounded-lg border border-slate-200 p-3 bg-slate-50">
                   <div className="text-xs font-semibold mb-2">Agregar nuevo préstamo</div>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                    <input type="text" className="rounded-lg border border-slate-300 px-3 py-2 md:col-span-1" placeholder="Concepto" value={entryForm.concept} onChange={e=> setEntryForm(f => ({ ...f, concept: e.target.value }))} />
-                    <input type="number" className="rounded-lg border border-slate-300 px-3 py-2 md:col-span-1" placeholder="Monto" value={entryForm.amount} onChange={e=> setEntryForm(f => ({ ...f, amount: e.target.value.replace(/[^\d]/g, '') }))} />
-                    <input type="date" className="rounded-lg border border-slate-300 px-3 py-2 md:col-span-2" value={entryForm.date} onChange={e=> setEntryForm(f => ({ ...f, date: e.target.value }))} />
+                    <input type="text" className="rounded-lg border border-slate-300 px-3 py-2 md:col-span-1 text-sm" placeholder="Concepto" value={entryForm.concept} onChange={e=> setEntryForm(f => ({ ...f, concept: e.target.value }))} />
+                    <input type="number" className="rounded-lg border border-slate-300 px-3 py-2 md:col-span-1 text-sm" placeholder="Monto" value={entryForm.amount} onChange={e=> setEntryForm(f => ({ ...f, amount: e.target.value.replace(/[^\d]/g, '') }))} />
+                    <input type="date" className="rounded-lg border border-slate-300 px-3 py-2 md:col-span-2 text-sm" value={entryForm.date} onChange={e=> setEntryForm(f => ({ ...f, date: e.target.value }))} />
                   </div>
                   <div className="mt-2 flex justify-end">
-                    <button className="px-3 py-2 rounded-lg bg-slate-900 text-white font-semibold" onClick={()=> {
+                    <button className="px-3 py-2 rounded-lg bg-slate-900 text-white font-semibold text-sm hover:bg-slate-800" onClick={()=> {
                       if(!entryForm.amount) return alert('Ingresa un monto.');
                       onAddEntry({ profileId: selected.id, ...entryForm });
                       setEntryForm(f => ({ ...f, amount: '', concept: '' }));
@@ -1432,12 +1492,12 @@ function LoanProfilesManager({ profiles, selectedProfileId, onAddEntry, onAbonar
                 <div className="rounded-lg border border-emerald-200 p-3 bg-emerald-50">
                   <div className="text-xs font-semibold mb-2 text-emerald-800">Abonar a este perfil</div>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                    <input type="text" className="rounded-lg border border-emerald-300 px-3 py-2 md:col-span-1" placeholder="Concepto del abono" value={abonoForm.concept} onChange={e=> setAbonoForm(f => ({ ...f, concept: e.target.value }))} />
-                    <input type="number" className="rounded-lg border border-emerald-300 px-3 py-2 md:col-span-1" placeholder="Valor del abono" value={abonoForm.amount} onChange={e=> setAbonoForm(f => ({ ...f, amount: e.target.value.replace(/[^\d]/g, '') }))} />
-                    <input type="date" className="rounded-lg border border-emerald-300 px-3 py-2 md:col-span-2" value={abonoForm.date} onChange={e=> setAbonoForm(f => ({ ...f, date: e.target.value }))} />
+                    <input type="text" className="rounded-lg border border-emerald-300 px-3 py-2 md:col-span-1 text-sm" placeholder="Concepto del abono" value={abonoForm.concept} onChange={e=> setAbonoForm(f => ({ ...f, concept: e.target.value }))} />
+                    <input type="number" className="rounded-lg border border-emerald-300 px-3 py-2 md:col-span-1 text-sm" placeholder="Valor del abono" value={abonoForm.amount} onChange={e=> setAbonoForm(f => ({ ...f, amount: e.target.value.replace(/[^\d]/g, '') }))} />
+                    <input type="date" className="rounded-lg border border-emerald-300 px-3 py-2 md:col-span-2 text-sm" value={abonoForm.date} onChange={e=> setAbonoForm(f => ({ ...f, date: e.target.value }))} />
                   </div>
                   <div className="mt-2 flex justify-end">
-                    <button className="px-3 py-2 rounded-lg bg-emerald-700 text-white font-semibold hover:bg-emerald-800" onClick={()=> {
+                    <button className="px-3 py-2 rounded-lg bg-emerald-700 text-white font-semibold text-sm hover:bg-emerald-800" onClick={()=> {
                       if(!abonoForm.amount) return alert('Ingresa un valor de abono.');
                       onAbonar({ profileId: selected.id, ...abonoForm });
                       setAbonoForm(f => ({ ...f, amount: '', concept: f.concept || 'Abono' }));
@@ -1446,20 +1506,21 @@ function LoanProfilesManager({ profiles, selectedProfileId, onAddEntry, onAbonar
                 </div>
               </div>
 
-              <div className="rounded-lg border border-slate-200 p-2 bg-white">
-                {selectedEntries.length === 0 && <div className="text-xs opacity-60 p-2">Este perfil no tiene movimientos aún.</div>}
+              <div className="rounded-lg border border-slate-200 p-3 bg-white">
+                <div className="text-xs font-semibold mb-3">Historial de movimientos</div>
+                {selectedEntries.length === 0 && <div className="text-xs opacity-60 text-center py-4">Este perfil no tiene movimientos aún.</div>}
 
                 {selectedEntries.length > 0 && (
-                  <div className="max-h-[420px] overflow-auto space-y-2 pr-1">
+                  <div className="space-y-2 max-h-[300px] overflow-y-auto pr-2">
                     {selectedEntries.map(e => (
-                      <div key={e.id} className="rounded-lg border border-slate-200 p-2 flex items-center justify-between">
-                        <div>
-                          <div className="font-semibold text-sm">{e.concept || 'Sin concepto'}</div>
-                          <div className="text-xs opacity-60">{new Date(e.date).toLocaleDateString('es-CO')}</div>
+                      <div key={e.id} className="rounded-lg border border-slate-200 p-3 flex items-center justify-between bg-slate-50 hover:bg-slate-100 transition">
+                        <div className="flex-1 min-w-0">
+                          <div className="font-semibold text-sm truncate">{e.concept || 'Sin concepto'}</div>
+                          <div className="text-xs opacity-60 mt-0.5">{new Date(e.date).toLocaleDateString('es-CO')}</div>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <div className={`font-semibold ${e.amount < 0 ? 'text-emerald-700' : 'text-slate-900'}`}>{fmtMoney(e.amount)}</div>
-                          <button className="text-xs px-2 py-1 rounded-lg border" onClick={()=> onDeleteEntry(selected.id, e.id)}>Eliminar</button>
+                        <div className="flex items-center gap-3 ml-2 flex-shrink-0">
+                          <div className={`font-bold text-sm whitespace-nowrap ${e.amount < 0 ? 'text-emerald-700' : 'text-slate-900'}`}>{fmtMoney(e.amount)}</div>
+                          <button className="text-xs px-2 py-1.5 rounded-lg border border-rose-300 bg-rose-50 text-rose-600 hover:bg-rose-100 font-medium transition" onClick={()=> onDeleteEntry(selected.id, e.id)}>✕</button>
                         </div>
                       </div>
                     ))}
