@@ -281,6 +281,24 @@ function loadAll(){
 }
 function saveAll(x){ localStorage.setItem(ALL_KEY, JSON.stringify(x)); }
 
+function mapAuthError(err){
+  const code = err?.code || '';
+  if(code === 'auth/unauthorized-domain') return 'Dominio no autorizado en Firebase Auth. Agrega localhost y tebann.github.io en Authorized domains.';
+  if(code === 'auth/operation-not-allowed') return 'Google no está habilitado en Firebase Authentication > Sign-in method.';
+  if(code === 'auth/popup-blocked') return 'El navegador bloqueó la ventana emergente. Habilita popups para este sitio.';
+  if(code === 'auth/popup-closed-by-user') return 'Cerraste la ventana de inicio de sesión antes de completar el acceso.';
+  if(code === 'auth/cancelled-popup-request') return 'Ya hay una solicitud de login en curso. Intenta de nuevo.';
+  if(code === 'auth/network-request-failed') return 'Fallo de red al conectar con Firebase. Revisa tu conexión.';
+  return `No se pudo iniciar sesión con Google.${code ? ` (${code})` : ''}`;
+}
+
+function mapCloudSyncError(err){
+  const code = err?.code || '';
+  if(code === 'permission-denied') return 'Firestore rechazó permisos. Revisa las reglas y que estés autenticado.';
+  if(code === 'unavailable') return 'Firestore no está disponible temporalmente. Intenta de nuevo.';
+  return `No se pudo sincronizar con la nube.${code ? ` (${code})` : ''}`;
+}
+
 // ------------------ APP ------------------
 export default function App(){
   const [all, setAll] = useState(loadAll);
@@ -342,7 +360,7 @@ export default function App(){
         lastCloudSnapshotRef.current = JSON.stringify(next);
         setCloudReady(true);
       }catch(e){
-        setAuthErr('No se pudo sincronizar con la nube. Verifica tu configuración de Firebase.');
+        setAuthErr(mapCloudSyncError(e));
         setCloudReady(false);
       }
     });
@@ -389,7 +407,7 @@ export default function App(){
       setAuthErr('');
       await signInWithGoogle();
     }catch(e){
-      setAuthErr('No se pudo iniciar sesión con Google.');
+      setAuthErr(mapAuthError(e));
     }
   }
 
