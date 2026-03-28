@@ -129,6 +129,21 @@ Este proyecto ya trae workflow listo en:
 6. Cuando termine en verde, vuelve a `Settings` > `Pages`.
 7. Verás la URL publicada.
 
+### Secrets requeridos para producción (GitHub Actions)
+
+Como `.env` no se sube al repositorio, debes crear estos Secrets en:
+
+`GitHub > Repo > Settings > Secrets and variables > Actions > New repository secret`
+
+- `VITE_FIREBASE_API_KEY`
+- `VITE_FIREBASE_AUTH_DOMAIN`
+- `VITE_FIREBASE_PROJECT_ID`
+- `VITE_FIREBASE_STORAGE_BUCKET`
+- `VITE_FIREBASE_MESSAGING_SENDER_ID`
+- `VITE_FIREBASE_APP_ID`
+
+Si no los configuras, la web en GitHub Pages no podrá iniciar sesión con Google.
+
 URL esperada:
 
 ```text
