@@ -1,14 +1,22 @@
-import { signInWithPopup, signInWithRedirect, onAuthStateChanged, signOut } from 'firebase/auth';
+import { browserLocalPersistence, onAuthStateChanged, setPersistence, signInWithPopup, signInWithRedirect, signOut } from 'firebase/auth';
 import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
 import { auth, db, googleProvider, hasFirebaseConfig } from './firebase';
 
 const COLLECTION = 'mi_nomina_users';
 const DOC = 'app';
 
+let persistenceReady = false;
+async function ensureLocalPersistence(){
+  if(persistenceReady || !auth) return;
+  await setPersistence(auth, browserLocalPersistence);
+  persistenceReady = true;
+}
+
 export async function signInWithGoogle() {
   if (!hasFirebaseConfig || !auth || !googleProvider) {
     throw new Error('Firebase no está configurado.');
   }
+  await ensureLocalPersistence();
   try {
     const res = await signInWithPopup(auth, googleProvider);
     return res.user;
@@ -26,6 +34,7 @@ export function watchAuth(callback) {
     callback(null);
     return () => {};
   }
+  ensureLocalPersistence().catch(() => {});
   return onAuthStateChanged(auth, callback);
 }
 

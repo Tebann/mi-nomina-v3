@@ -28,7 +28,17 @@ function fmtMoneyCompact(n){
   if (Math.abs(x) < 1000) return fmtMoney(x);
   return `$${compactNumber.format(x)}`;
 }
-function ymd(d = new Date()){ return new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString().slice(0,10); }
+function ymd(d = new Date()){
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+function parseYmdLocal(dateStr){
+  if(!dateStr) return new Date();
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
+}
 function monthKey(y,m){ const mm = (m+1).toString().padStart(2,'0'); return `${y}-${mm}`; }
 function startOfMonth(y,m){ return new Date(y,m,1); }
 function daysInMonth(y,m){ return new Date(y,m+1,0).getDate(); }
@@ -69,7 +79,7 @@ function advanceDateStr(dateStr, addMonths) {
   if (!dateStr) return '';
   const [y, m, d] = dateStr.split('-');
   const date = new Date(y, Number(m) - 1 + addMonths, Number(d));
-  return date.toISOString().slice(0,10);
+  return ymd(date);
 }
 
 function sanitizeAmount(value){
@@ -737,6 +747,102 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
     updateUserWith({ loanProfiles: next });
   }
 
+  function deleteLoanProfile(profileId){
+    const profile = loanProfiles.find(p => p.id === profileId);
+    if(!profile) return;
+    if(!confirm(`Eliminar el perfil "${profile.name}" y todos sus movimientos?`)) return;
+    const next = loanProfiles.filter(p => p.id !== profileId);
+    updateUserWith({ loanProfiles: next });
+    if(selectedLoanProfileId === profileId){
+      setSelectedLoanProfileId(next[0]?.id || '');
+    }
+  }
+
+  function getCreditChainKey(expense){
+    if(expense?.recurringGroupId) return `rg:${expense.recurringGroupId}`;
+    const legacy = getLegacyRecurringKey(expense);
+    if(legacy) return `lg:${legacy}`;
+    return `id:${expense?.id || ''}`;
+  }
+
+  function getCreditRemaining(expense){
+    if(normalizeKind(expense?.kind) !== 'CREDITOS') return 0;
+    const chainKey = getCreditChainKey(expense);
+    return user.expenses
+      .filter(e => normalizeKind(e.kind) === 'CREDITOS' && getCreditChainKey(e) === chainKey)
+      .reduce((sum, e) => sum + (e.paid ? 0 : sanitizeAmount(e.amount)), 0);
+  }
+
+  function openCreditAbono(expense){
+    setCreditAbonoTargetId(expense.id);
+    setCreditAbonoAmount('');
+    setCreditAbonoMode('cuotas');
+    setShowCreditAbonoModal(true);
+  }
+
+  function applyCreditAbono(){
+    const target = user.expenses.find(e => e.id === creditAbonoTargetId);
+    const amount = sanitizeAmount(creditAbonoAmount);
+    if(!target || amount <= 0) return;
+
+    const chainKey = getCreditChainKey(target);
+    const chain = user.expenses.filter(e => normalizeKind(e.kind) === 'CREDITOS' && getCreditChainKey(e) === chainKey);
+    const openItems = chain.filter(e => !e.paid && sanitizeAmount(e.amount) > 0);
+    if(openItems.length === 0) return;
+
+    let remaining = amount;
+    const updates = new Map();
+    openItems.forEach(e => updates.set(e.id, { ...e, amount: sanitizeAmount(e.amount) }));
+
+    if(creditAbonoMode === 'cuotas'){
+      const ordered = [...openItems].sort((a,b)=> b.month.localeCompare(a.month));
+      for(const e of ordered){
+        if(remaining <= 0) break;
+        const cur = updates.get(e.id);
+        const curAmount = sanitizeAmount(cur.amount);
+        const reduce = Math.min(curAmount, remaining);
+        const nextAmount = curAmount - reduce;
+        remaining -= reduce;
+        updates.set(e.id, {
+          ...cur,
+          amount: nextAmount,
+          paid: nextAmount === 0 ? true : cur.paid,
+          info: `${cur.info || ''}${nextAmount === 0 ? ' (cuota saldada por abono)' : ''}`.trim(),
+        });
+      }
+    } else {
+      let active = [...openItems].sort((a,b)=> a.month.localeCompare(b.month));
+      while(remaining > 0 && active.length){
+        const base = Math.max(1, Math.floor(remaining / active.length));
+        const nextActive = [];
+        for(const e of active){
+          if(remaining <= 0){
+            nextActive.push(e);
+            continue;
+          }
+          const cur = updates.get(e.id);
+          const curAmount = sanitizeAmount(cur.amount);
+          if(curAmount <= 0) continue;
+          const reduce = Math.min(curAmount, base, remaining);
+          const nextAmount = curAmount - reduce;
+          remaining -= reduce;
+          updates.set(e.id, {
+            ...cur,
+            amount: nextAmount,
+            paid: nextAmount === 0 ? true : cur.paid,
+          });
+          if(nextAmount > 0) nextActive.push(e);
+        }
+        active = nextActive;
+      }
+    }
+
+    updateUserWith({
+      expenses: user.expenses.map(e => updates.get(e.id) || e)
+    });
+    setShowCreditAbonoModal(false);
+  }
+
   // day types
   function createDayType({ name, place, rate, color }){ const t = { id: uid(), name, place: place||'', rate: Number(rate)||0, color: color||'#60a5fa' }; updateUserWith({ dayTypes: [t, ...user.dayTypes] }); }
   function deleteDayType(id){ updateUserWith({ dayTypes: user.dayTypes.filter(t => t.id !== id) }); }
@@ -780,6 +886,10 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
   const [showLoanModal, setShowLoanModal] = useState(false);
   const [selectedLoanProfileId, setSelectedLoanProfileId] = useState('');
   const [expenseToEdit, setExpenseToEdit] = useState(null); // NUEVO ESTADO
+  const [showCreditAbonoModal, setShowCreditAbonoModal] = useState(false);
+  const [creditAbonoTargetId, setCreditAbonoTargetId] = useState('');
+  const [creditAbonoAmount, setCreditAbonoAmount] = useState('');
+  const [creditAbonoMode, setCreditAbonoMode] = useState('cuotas');
 
   useEffect(()=>{
     if(!loanProfiles.length){
@@ -959,7 +1069,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
         </div>
       </section>
 
-      <main className="max-w-6xl mx-auto grid grid-cols-1 gap-6">
+      <main className="max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-6">
         <section className="space-y-6">
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-[0_8px_24px_rgba(0,0,0,0.06)]">
             <div className="flex items-center justify-between mb-3">
@@ -980,6 +1090,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
             <LoanProfilesSummary
               profiles={loanProfiles}
               onOpenProfile={(profileId)=> { setSelectedLoanProfileId(profileId); setShowLoanModal(true); }}
+              onDeleteProfile={deleteLoanProfile}
               onCreateProfile={()=> {
                 const name = prompt('Nombre del nuevo perfil');
                 if(!name || !name.trim()) return;
@@ -991,6 +1102,10 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
               }}
             />
           </div>
+
+        </section>
+
+        <section className="space-y-6">
 
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-[0_8px_24px_rgba(0,0,0,0.06)]">
             <div className="flex items-center justify-between mb-2">
@@ -1006,44 +1121,49 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
                 const credits = monthExpenses.filter(e=> normalizeKind(e.kind) === 'CREDITOS').slice().sort((a,b)=> b.amount - a.amount);
                 const fixed = monthExpenses.filter(e=> normalizeKind(e.kind) === 'GASTOS FIJOS').slice().sort((a,b)=> b.amount - a.amount);
                 const subs = monthExpenses.filter(e=> normalizeKind(e.kind) === 'SUSCRIPCIONES').slice().sort((a,b)=> b.amount - a.amount);
+                const totalCreditsRemaining = user.expenses
+                  .filter(e => normalizeKind(e.kind) === 'CREDITOS')
+                  .reduce((sum, e) => sum + (e.paid ? 0 : sanitizeAmount(e.amount)), 0);
 
                 const Section = ({ title, items, titleBg }) => {
                   const total = items.reduce((s, it) => s + (sanitizeAmount(it.amount) || 0), 0);
-                  const isMobile = window.innerWidth < 768;
+                  const isCredits = title === 'CREDITOS';
                   
                   return (
                     <div className="rounded-lg border border-slate-200 overflow-hidden">
                       <div className={`px-4 py-2 text-sm font-bold leading-tight text-center ${titleBg} text-white`}>{title}</div>
-                      {!isMobile ? (
-                        // Vista de tabla para desktop
-                        <div className="bg-white overflow-x-auto">
-                          <table className="w-full table-fixed min-w-[620px] sm:min-w-0">
+                      <div className="hidden md:block bg-white">
+                        <table className="w-full table-fixed">
                             <thead>
                               <tr className="text-sm text-left">
-                                <th className="px-4 py-2 w-1/2">Concepto</th>
-                                <th className="px-4 py-2 w-1/4 text-right">Precio</th>
-                                <th className="px-4 py-2 w-1/4 text-center">Acciones</th>
+                                <th className="px-4 py-2 w-[50%]">Concepto</th>
+                                <th className="px-4 py-2 w-[18%] text-right">Precio</th>
+                                <th className="px-4 py-2 w-[32%] text-center">Acciones</th>
                               </tr>
                             </thead>
                             <tbody>
                               {items.map(e => (
                                 <tr key={e.id} className={`border-t ${e.paid ? 'bg-emerald-50' : ''}`}>
-                                  <td className={`px-3 py-2 align-middle min-w-0 ${e.paid ? 'text-emerald-800' : ''}`}>
+                                  <td className={`px-3 py-2 align-middle min-w-0 w-[50%] ${e.paid ? 'text-emerald-800' : ''}`}>
                                       <div className="flex flex-col min-w-0">
-                                        <div className="text-sm font-semibold truncate">{e.concept}</div>
-                                        {(e.cutoffDate || e.info) && (
-                                          <div className="text-xs opacity-60 truncate mt-0.5">
-                                            {[
-                                              e.cutoffDate ? formatTextDate(e.cutoffDate) : '', 
-                                              e.info
-                                            ].filter(Boolean).join(' - ')}
+                                        <div className="text-sm font-semibold whitespace-normal break-words">{e.concept}</div>
+                                        {(e.cutoffDate || e.info || normalizeKind(e.kind) === 'CREDITOS') && (
+                                          <div className="text-xs opacity-60 mt-0.5 leading-snug">
+                                            {e.cutoffDate && <div>{formatTextDate(e.cutoffDate)}</div>}
+                                            {(e.info || normalizeKind(e.kind) === 'CREDITOS') && (
+                                              <div className="whitespace-nowrap overflow-hidden text-ellipsis">
+                                                {normalizeKind(e.kind) === 'CREDITOS'
+                                                  ? `${e.info || ''}${e.info ? ' - ' : ''}Faltan: ${fmtMoney(getCreditRemaining(e))}`
+                                                  : (e.info || '')}
+                                              </div>
+                                            )}
                                           </div>
                                         )}
                                       </div>
                                     </td>
-                                  <td className={`px-3 py-2 align-middle text-right text-sm whitespace-nowrap ${e.paid ? 'text-emerald-800' : ''}`}>{fmtMoney(e.amount)}</td>
-                                  <td className="px-4 py-3 align-middle text-center overflow-visible">
-                                    <div className="flex items-center justify-center gap-2 whitespace-nowrap">
+                                  <td className={`px-3 py-2 align-middle text-right text-sm whitespace-nowrap w-[18%] ${e.paid ? 'text-emerald-800' : ''}`}>{fmtMoney(e.amount)}</td>
+                                  <td className="px-4 py-3 align-middle text-center overflow-visible w-[32%]">
+                                    <div className="inline-flex items-center justify-center gap-1.5 whitespace-nowrap">
                                       <button title={"Pago"} aria-label="marcar-pagado" onClick={()=> toggleExpensePaid(e.id)} className={("w-7 h-7 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 "+(e.paid ? "bg-green-100 border-green-300":"bg-white border-slate-300"))}>
                                         {e.paid ? (
                                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-green-700">
@@ -1067,6 +1187,12 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
                                           <path d="M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                                         </svg>
                                       </button>
+                                      {normalizeKind(e.kind) === 'CREDITOS' && (
+                                        <button title="Abonar crédito" aria-label="abonar-credito" onClick={()=> openCreditAbono(e)} className="w-7 h-7 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-amber-200 hover:bg-amber-50 hover:border-amber-300 transition text-amber-700 font-semibold">
+                                          $
+                                        </button>
+                                      )}
+                                      {normalizeKind(e.kind) !== 'CREDITOS' && <span aria-hidden className="w-7 h-7 flex-shrink-0" />}
                                     </div>
                                   </td>
                                 </tr>
@@ -1080,26 +1206,37 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
                             <tfoot>
                               <tr className="text-sm font-semibold bg-slate-50">
                                 <td className="px-4 py-2">Total</td>
-                                <td className="px-4 py-2 text-right">{fmtMoney(total)}</td>
-                                <td className="px-4 py-2" />
+                                <td className={`px-4 py-2 text-right`}>
+                                  {isCredits ? (
+                                    <span>{fmtMoney(total)}</span>
+                                  ) : (
+                                    <span>{fmtMoney(total)}</span>
+                                  )}
+                                </td>
+                                <td className="px-4 py-2 text-center">
+                                  {isCredits ? <span className="text-sm font-semibold text-indigo-700">{fmtMoney(totalCreditsRemaining)}</span> : null}
+                                </td>
                               </tr>
                             </tfoot>
                           </table>
                         </div>
-                      ) : (
-                        // Vista de cards para móvil
-                        <div className="bg-white space-y-2 p-3">
+
+                        <div className="md:hidden bg-white space-y-2 p-3">
                           {items.map(e => (
                             <div key={e.id} className={`rounded-lg border p-3 flex flex-col ${e.paid ? 'bg-emerald-50 border-emerald-200' : 'bg-white border-slate-200'}`}>
                               <div className="flex items-start justify-between mb-2">
                                 <div className="flex-1 min-w-0">
                                   <div className={`font-semibold text-sm truncate ${e.paid ? 'text-emerald-800' : ''}`}>{e.concept}</div>
-                                  {(e.cutoffDate || e.info) && (
-                                    <div className={`text-xs opacity-60 truncate mt-1 ${e.paid ? 'text-emerald-700' : ''}`}>
-                                      {[
-                                        e.cutoffDate ? formatTextDate(e.cutoffDate) : '', 
-                                        e.info
-                                      ].filter(Boolean).join(' - ')}
+                                  {(e.cutoffDate || e.info || normalizeKind(e.kind) === 'CREDITOS') && (
+                                    <div className={`text-xs opacity-60 mt-1 leading-snug ${e.paid ? 'text-emerald-700' : ''}`}>
+                                      {e.cutoffDate && <div>{formatTextDate(e.cutoffDate)}</div>}
+                                      {(e.info || normalizeKind(e.kind) === 'CREDITOS') && (
+                                        <div className="whitespace-nowrap overflow-hidden text-ellipsis">
+                                          {normalizeKind(e.kind) === 'CREDITOS'
+                                            ? `${e.info || ''}${e.info ? ' - ' : ''}Faltan: ${fmtMoney(getCreditRemaining(e))}`
+                                            : (e.info || '')}
+                                        </div>
+                                      )}
                                     </div>
                                   )}
                                 </div>
@@ -1130,6 +1267,11 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
                                       <path d="M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                                     </svg>
                                   </button>
+                                  {normalizeKind(e.kind) === 'CREDITOS' && (
+                                    <button title="Abonar crédito" aria-label="abonar-credito" onClick={()=> openCreditAbono(e)} className="w-6 h-6 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-amber-200 hover:bg-amber-50 hover:border-amber-300 transition text-amber-700 text-[10px]">
+                                      $
+                                    </button>
+                                  )}
                                 </div>
                               </div>
                             </div>
@@ -1139,12 +1281,23 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
                           )}
                           <div className="border-t border-slate-200 pt-3 mt-3">
                             <div className="flex items-center justify-between text-sm font-semibold">
-                              <span>Total</span>
-                              <span>{fmtMoney(total)}</span>
+                              {isCredits ? (
+                                <>
+                                  <span>Mensual</span>
+                                  <span>{fmtMoney(total)}</span>
+                                </>
+                              ) : (
+                                <>
+                                  <span>Total</span>
+                                  <span>{fmtMoney(total)}</span>
+                                </>
+                              )}
                             </div>
+                            {isCredits && (
+                              <div className="mt-1 text-center text-sm font-semibold text-indigo-700">{fmtMoney(totalCreditsRemaining)}</div>
+                            )}
                           </div>
                         </div>
-                      )}
                     </div>
                   );
                 };
@@ -1161,6 +1314,35 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
           </div>
         </section>
       </main>
+
+      {showCreditAbonoModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl p-6 shadow-[0_12px_28px_rgba(0,0,0,0.18)]">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xl font-bold">Abonar a Crédito</h3>
+              <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={()=> setShowCreditAbonoModal(false)}>Cerrar</button>
+            </div>
+            <div className="space-y-3">
+              <label className="block text-sm">
+                <div className="mb-1">Valor del abono extra</div>
+                <input type="number" className="w-full rounded-lg border border-slate-300 px-3 py-2" value={creditAbonoAmount} onChange={e=> setCreditAbonoAmount(e.target.value.replace(/[^\d]/g, ''))} />
+              </label>
+              <label className="block text-sm">
+                <div className="mb-1">Estrategia (bola de nieve)</div>
+                <select className="w-full rounded-lg border border-slate-300 px-3 py-2" value={creditAbonoMode} onChange={e=> setCreditAbonoMode(e.target.value)}>
+                  <option value="cuotas">Reducir cantidad de cuotas</option>
+                  <option value="valor">Reducir valor de cuotas futuras</option>
+                </select>
+              </label>
+              <p className="text-xs opacity-70">Este abono se aplica al credito seleccionado sin borrar historial.</p>
+            </div>
+            <div className="flex justify-end gap-2 mt-4">
+              <button className="px-4 py-2 rounded-lg border border-slate-300" onClick={()=> setShowCreditAbonoModal(false)}>Cancelar</button>
+              <button className="px-4 py-2 rounded-lg bg-slate-900 text-white" onClick={applyCreditAbono}>Aplicar abono</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {detailDate && <DayDetailModal date={detailDate} onClose={()=> setDetailDate(null)} user={user} dayTypes={user.dayTypes} onAddWork={(p)=> addWorkDay(p)} onDeleteWork={(id)=> deleteWorkDay(id)} />}
 
@@ -1261,7 +1443,7 @@ function CalendarCell({ date, month, user, onOpenDetail }){
   return (
     <div role="button" tabIndex={0} onKeyDown={(e)=> { if(e.key==='Enter'||e.key===' ') onOpenDetail(key); }} onClick={()=> onOpenDetail(key)} className={`h-20 rounded-xl border bg-white p-2 flex flex-col justify-between ${isOtherMonth? 'opacity-40':''} cursor-pointer shadow-sm hover:shadow-md hover:border-slate-400 transition`}>
       <div className="flex items-center justify-between">
-        <div className="text-xs font-semibold opacity-0">{date.getDate()}</div>
+        <div className="text-xs font-semibold">{date.getDate()}</div>
         <div className="flex gap-1">{showIndicators.map((c,i)=> <span key={i} className="w-3 h-3 rounded-sm border border-slate-200" style={{ background: c }} />)}</div>
       </div>
       <div className="flex items-end justify-between">
@@ -1286,7 +1468,7 @@ function DayDetailModal({ date, onClose, user, dayTypes, onAddWork, onDeleteWork
       <div className="w-full max-w-3xl bg-white rounded-2xl p-4 shadow-lg">
         <div className="flex items-center justify-between mb-3">
           <div>
-            <div className="text-sm opacity-70">Detalle – {new Date(date).toLocaleDateString('es-CO', { weekday:'long', day:'numeric', month:'long', year:'numeric' })}</div>
+            <div className="text-sm opacity-70">Detalle – {parseYmdLocal(date).toLocaleDateString('es-CO', { weekday:'long', day:'numeric', month:'long', year:'numeric' })}</div>
             <div className="text-xs opacity-50">Trabajos del día</div>
           </div>
           <div className="flex gap-2"><button className="px-3 py-1 rounded-lg border border-slate-300" onClick={onClose}>Cerrar</button></div>
@@ -1416,7 +1598,7 @@ function RegisterExpense({ onSubmit, onClose, initialData }){
   );
 }
 
-function LoanProfilesSummary({ profiles, onOpenProfile, onCreateProfile }){
+function LoanProfilesSummary({ profiles, onOpenProfile, onCreateProfile, onDeleteProfile }){
   const profileTotal = (p) => (p.entries || []).reduce((a,b)=> a + (Number(b.amount) || 0), 0);
   const allTotal = profiles.reduce((sum, p) => sum + profileTotal(p), 0);
 
@@ -1437,12 +1619,29 @@ function LoanProfilesSummary({ profiles, onOpenProfile, onCreateProfile }){
           const lastDate = entries.length ? entries[0].date : '';
           return (
             <button key={p.id} className="rounded-xl border border-slate-200 p-3 bg-white hover:border-slate-400 hover:bg-slate-50 text-left transition" onClick={()=> onOpenProfile(p.id)}>
-              <div className="flex items-center justify-between">
-                <div className="font-semibold">{p.name}</div>
-                <div className="text-sm font-bold text-slate-800">{fmtMoney(profileTotal(p))}</div>
+              <div className="flex items-start justify-between gap-2">
+                <div className="font-semibold truncate">{p.name}</div>
+                <div className="flex items-center gap-2">
+                  <div className="text-sm font-bold text-slate-800 whitespace-nowrap">{fmtMoney(profileTotal(p))}</div>
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    className="text-xs px-2 py-0.5 rounded border border-rose-300 text-rose-600 hover:bg-rose-50"
+                    onClick={(ev)=> { ev.preventDefault(); ev.stopPropagation(); onDeleteProfile?.(p.id); }}
+                    onKeyDown={(ev)=> {
+                      if(ev.key === 'Enter' || ev.key === ' '){
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        onDeleteProfile?.(p.id);
+                      }
+                    }}
+                  >
+                    Borrar
+                  </span>
+                </div>
               </div>
               <div className="text-xs opacity-60 mt-1">{entries.length} movimientos</div>
-              <div className="text-xs opacity-60">{lastDate ? `Último: ${new Date(lastDate).toLocaleDateString('es-CO')}` : 'Sin movimientos'}</div>
+              <div className="text-xs opacity-60">{lastDate ? `Último: ${parseYmdLocal(lastDate).toLocaleDateString('es-CO')}` : 'Sin movimientos'}</div>
             </button>
           );
         })}
@@ -1516,7 +1715,7 @@ function LoanProfilesManager({ profiles, selectedProfileId, onAddEntry, onAbonar
                       <div key={e.id} className="rounded-lg border border-slate-200 p-3 flex items-center justify-between bg-slate-50 hover:bg-slate-100 transition">
                         <div className="flex-1 min-w-0">
                           <div className="font-semibold text-sm truncate">{e.concept || 'Sin concepto'}</div>
-                          <div className="text-xs opacity-60 mt-0.5">{new Date(e.date).toLocaleDateString('es-CO')}</div>
+                          <div className="text-xs opacity-60 mt-0.5">{parseYmdLocal(e.date).toLocaleDateString('es-CO')}</div>
                         </div>
                         <div className="flex items-center gap-3 ml-2 flex-shrink-0">
                           <div className={`font-bold text-sm whitespace-nowrap ${e.amount < 0 ? 'text-emerald-700' : 'text-slate-900'}`}>{fmtMoney(e.amount)}</div>
