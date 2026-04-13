@@ -15,6 +15,7 @@ import { loadCloudData, saveCloudData, signInWithGoogle, signOutGoogle, watchAut
 */
 
 const ALL_KEY = "miNomina_v2";
+const THEME_KEY = "miNomina_theme";
 const CLOUD_MIGRATION_PREFIX = "miNomina_cloud_migrated_";
 const BACKUP_PREFIX = `${ALL_KEY}_backup_`;
 const MONTHS_ES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
@@ -318,9 +319,18 @@ function mapCloudSyncError(err){
   return `No se pudo sincronizar con la nube.${code ? ` (${code})` : ''}`;
 }
 
+function getInitialTheme(){
+  try{
+    const saved = localStorage.getItem(THEME_KEY);
+    if(saved === 'dark' || saved === 'light') return saved;
+  }catch(_){ }
+  return 'light';
+}
+
 // ------------------ APP ------------------
 export default function App(){
   const [all, setAll] = useState(loadAll);
+  const [theme, setTheme] = useState(getInitialTheme);
   const [view, setView] = useState('app'); // app | profile
   const [googleUser, setGoogleUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
@@ -329,6 +339,13 @@ export default function App(){
   const lastCloudSnapshotRef = useRef('');
 
   useEffect(()=> saveAll(all), [all]);
+
+  useEffect(()=>{
+    try{
+      document.documentElement.setAttribute('data-theme', theme);
+      localStorage.setItem(THEME_KEY, theme);
+    }catch(_){ }
+  }, [theme]);
 
   useEffect(()=>{
     if(!hasFirebaseConfig){
@@ -440,20 +457,34 @@ export default function App(){
     }catch(_){ }
   }
 
-  if(!hasFirebaseConfig) return <GoogleAuthScreen disabled message="Falta configurar Firebase. Crea un archivo .env con tus llaves y reinicia la app." onGoogleLogin={handleGoogleLogin} error={authErr} />;
-  if(!authReady) return <LoadingScreen text="Preparando autenticación..." />;
-  if(!googleUser) return <GoogleAuthScreen onGoogleLogin={handleGoogleLogin} error={authErr} />;
-  if(!cloudReady) return <LoadingScreen text="Sincronizando tus datos..." />;
-  if(!currentUser) return <LoadingScreen text="Preparando tu perfil..." />;
-  if(view === 'profile') return <Usuario user={currentUser} onSave={(profile)=>{ patchCurrentUser({ profile }); setView('app'); }} onCancel={()=> setView('app')} />;
+  function toggleTheme(){
+    setTheme(prev => prev === 'dark' ? 'light' : 'dark');
+  }
 
-  return <MainApp user={currentUser} replaceUser={replaceUser} patchCurrentUser={patchCurrentUser} onLogout={handleLogout} goProfile={()=> setView('profile')} />;
+  let content = null;
+  if(!hasFirebaseConfig){
+    content = <GoogleAuthScreen disabled message="Falta configurar Firebase. Crea un archivo .env con tus llaves y reinicia la app." onGoogleLogin={handleGoogleLogin} error={authErr} />;
+  } else if(!authReady){
+    content = <LoadingScreen text="Preparando autenticación..." />;
+  } else if(!googleUser){
+    content = <GoogleAuthScreen onGoogleLogin={handleGoogleLogin} error={authErr} />;
+  } else if(!cloudReady){
+    content = <LoadingScreen text="Sincronizando tus datos..." />;
+  } else if(!currentUser){
+    content = <LoadingScreen text="Preparando tu perfil..." />;
+  } else if(view === 'profile'){
+    content = <Usuario user={currentUser} onSave={(profile)=>{ patchCurrentUser({ profile }); setView('app'); }} onCancel={()=> setView('app')} theme={theme} onToggleTheme={toggleTheme} />;
+  } else {
+    content = <MainApp user={currentUser} replaceUser={replaceUser} patchCurrentUser={patchCurrentUser} onLogout={handleLogout} goProfile={()=> setView('profile')} theme={theme} onToggleTheme={toggleTheme} />;
+  }
+
+  return content;
 }
 
 // ------------------ AUTH ------------------
 function GoogleAuthScreen({ onGoogleLogin, error, disabled = false, message = '' }){
   return (
-    <div className="min-h-screen bg-[#F6F2EA] p-4 md:p-8 flex items-center justify-center">
+    <div className="app-shell min-h-screen bg-transparent p-4 md:p-8 flex items-center justify-center">
       <div className="max-w-md w-full bg-white rounded-2xl p-6 shadow-[0_10px_30px_rgba(0,0,0,0.08)] border border-slate-200">
         <div className="text-center mb-4 flex flex-col items-center justify-center">
           <img
@@ -479,7 +510,7 @@ function GoogleAuthScreen({ onGoogleLogin, error, disabled = false, message = ''
 
 function LoadingScreen({ text }){
   return (
-    <div className="min-h-screen bg-[#F6F2EA] p-4 md:p-8 flex items-center justify-center">
+    <div className="app-shell min-h-screen bg-transparent p-4 md:p-8 flex items-center justify-center">
       <div className="max-w-md w-full bg-white rounded-2xl p-6 shadow-[0_10px_30px_rgba(0,0,0,0.08)] border border-slate-200 text-center">
         <div className="text-sm opacity-70">{text || 'Cargando...'}</div>
       </div>
@@ -487,12 +518,32 @@ function LoadingScreen({ text }){
   );
 }
 
+function ThemeToggleButton({ theme, onToggle }){
+  const nextTheme = theme === 'dark' ? 'light' : 'dark';
+  const label = nextTheme === 'dark' ? 'Cambiar a modo oscuro' : 'Cambiar a modo claro';
+
+  return (
+    <button type="button" className="theme-toggle" onClick={onToggle} title={label} aria-label={label}>
+      {nextTheme === 'dark' ? (
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
+          <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      ) : (
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
+          <circle cx="12" cy="12" r="4.2" stroke="currentColor" strokeWidth="1.8" />
+          <path d="M12 2.5v2.2M12 19.3v2.2M4.7 4.7l1.6 1.6M17.7 17.7l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.7 19.3l1.6-1.6M17.7 6.3l1.6-1.6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
 // ------------------ USUARIO ------------------
-function Usuario({ user, onSave, onCancel }){
+function Usuario({ user, onSave, onCancel, theme, onToggleTheme }){
   const [form, setForm] = useState({ ...user.profile });
   useEffect(()=> setForm({ ...user.profile }), [user]);
   return (
-    <div className="min-h-screen bg-[#F6F2EA] p-4 md:p-8 text-slate-900">
+    <div className="app-shell min-h-screen bg-transparent p-4 md:p-8 text-slate-900">
       <header className="max-w-6xl mx-auto flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">
           <img
@@ -507,7 +558,7 @@ function Usuario({ user, onSave, onCancel }){
           <h1 className="text-2xl font-bold tracking-tight">Usuario</h1>
         </div>
         <div className="flex gap-2 items-center">
-          <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={onCancel}>Cancelar</button>
+          <ThemeToggleButton theme={theme} onToggle={onToggleTheme} />
         </div>
       </header>
 
@@ -557,7 +608,7 @@ function Usuario({ user, onSave, onCancel }){
 }
 
 // ------------------ MAIN APP ------------------
-function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
+function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, theme, onToggleTheme }){
   const today = new Date();
   const [ym,setYm]=useState({ year: today.getFullYear(), month: today.getMonth() });
   const currentMonth = monthKey(ym.year, ym.month);
@@ -1013,7 +1064,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
   const [showTypesModal, setShowTypesModal] = useState(false);
 
   return (
-    <div className="min-h-screen bg-[#F6F2EA] p-4 md:p-8 text-slate-900">
+    <div className="app-shell min-h-screen bg-transparent p-4 md:p-8 text-slate-900">
       <header className="max-w-6xl mx-auto flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">
           <img
@@ -1031,13 +1082,17 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
           <span className="opacity-80 hidden sm:inline">{user.profile?.fullName || user.email}</span>
           <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={goProfile}>Usuario</button>
           <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={onLogout}>Salir</button>
+          <ThemeToggleButton theme={theme} onToggle={onToggleTheme} />
         </div>
       </header>
 
       <section className="max-w-6xl mx-auto mb-6">
         <div className="rounded-2xl border border-slate-200 bg-white p-4 grid grid-cols-1 sm:grid-cols-4 gap-3 items-center shadow-[0_10px_30px_rgba(0,0,0,0.06)]">
           <div className="col-span-1 sm:col-span-1">
-            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(16,185,129,0.06)] text-center sm:text-left" style={{ background: '#ECFDF3' }}>
+            <div
+              className="rounded-xl p-4 shadow-[0_8px_20px_rgba(16,185,129,0.09)] text-center sm:text-left"
+              style={{ background: 'var(--summary-income-bg)', border: '1px solid var(--summary-income-border)' }}
+            >
               <div className="text-sm opacity-70">Ingresos</div>
               <div className="text-2xl font-extrabold tracking-tight text-emerald-700">{fmtMoney(ingresos)}</div>
               <div className="text-xs opacity-60">{monthWorkDays.length} días</div>
@@ -1045,7 +1100,10 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
           </div>
 
           <div className="col-span-1 sm:col-span-1">
-            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(239,68,68,0.04)] text-center sm:text-left" style={{ background: '#FEF2F2' }}>
+            <div
+              className="rounded-xl p-4 shadow-[0_8px_20px_rgba(239,68,68,0.08)] text-center sm:text-left"
+              style={{ background: 'var(--summary-expense-bg)', border: '1px solid var(--summary-expense-border)' }}
+            >
               <div className="text-sm opacity-70">Gastos</div>
               <div className="text-2xl font-extrabold tracking-tight text-rose-700">{fmtMoney(gastos)}</div>
               <div className="text-xs opacity-60">{monthExpenses.length} gastos</div>
@@ -1053,7 +1111,10 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
           </div>
 
           <div className="col-span-1 sm:col-span-1">
-            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(59,130,246,0.04)] text-center sm:text-left" style={{ background: '#EFF6FF' }}>
+            <div
+              className="rounded-xl p-4 shadow-[0_8px_20px_rgba(59,130,246,0.09)] text-center sm:text-left"
+              style={{ background: 'var(--summary-balance-bg)', border: '1px solid var(--summary-balance-border)' }}
+            >
               <div className="text-sm opacity-70">Balance</div>
               <div className="text-2xl font-extrabold tracking-tight text-sky-700">{fmtMoney(balance)}</div>
               <div className="text-xs opacity-60">{balance>=0 ? 'Ahorro' : 'Déficit'}</div>
