@@ -327,6 +327,172 @@ function getInitialTheme(){
   return 'light';
 }
 
+function monthLabel(yyyyMm){
+  const [y, m] = (yyyyMm || '').split('-').map(Number);
+  if(!y || !m) return 'mes actual';
+  return `${MONTHS_ES[m - 1]} ${y}`;
+}
+
+function percent(part, total){
+  if(!total) return 0;
+  return Math.round((part / total) * 100);
+}
+
+function buildCreditChainKey(expense){
+  if(expense?.recurringGroupId) return `rg:${expense.recurringGroupId}`;
+  const legacy = getLegacyRecurringKey(expense);
+  if(legacy) return `lg:${legacy}`;
+  return `id:${expense?.id || ''}`;
+}
+
+function buildLobitoInsights({ user, currentMonth, monthExpenses, monthWorkDaysVal, loanProfiles, ingresos, gastos, balance }){
+  const prevMonth = addMonthsToKey(currentMonth, -1);
+  const prevExpenses = user.expenses.filter(e => e.month === prevMonth);
+
+  const paidCurrent = monthExpenses.filter(e => e.paid).length;
+  const paidPrev = prevExpenses.filter(e => e.paid).length;
+  const paidRateCurrent = percent(paidCurrent, monthExpenses.length);
+  const paidRatePrev = percent(paidPrev, prevExpenses.length);
+  const paidRateDiff = paidRateCurrent - paidRatePrev;
+
+  const currentWorkDays = monthWorkDaysVal.length;
+  const prevWorkDays = user.workDays.filter(w => w.date.slice(0,7) === prevMonth).length;
+  const workDaysDiff = currentWorkDays - prevWorkDays;
+
+  const categoryTotals = monthExpenses.reduce((acc, e) => {
+    const k = normalizeExpenseKind(e.kind);
+    acc[k] = (acc[k] || 0) + sanitizeAmount(e.amount);
+    return acc;
+  }, {});
+  const dominantCategoryEntry = Object.entries(categoryTotals).sort((a,b) => b[1] - a[1])[0];
+
+  const creditGroups = new Map();
+  user.expenses.forEach((e) => {
+    if(normalizeExpenseKind(e.kind) !== 'CREDITOS') return;
+    if(e.paid) return;
+    const amount = sanitizeAmount(e.amount);
+    if(amount <= 0) return;
+
+    const key = buildCreditChainKey(e);
+    const found = creditGroups.get(key) || { type: 'credito', name: e.concept || 'Crédito', amount: 0 };
+    found.amount += amount;
+    if(!found.cutoff && e.cutoffDate) found.cutoff = e.cutoffDate;
+    creditGroups.set(key, found);
+  });
+
+  const profileDebts = (loanProfiles || [])
+    .map((p) => ({
+      type: 'perfil',
+      name: p.name,
+      amount: (p.entries || []).reduce((a,b) => a + (Number(b.amount) || 0), 0)
+    }))
+    .filter((p) => p.amount > 0);
+
+  const creditDebts = Array.from(creditGroups.values()).filter((c) => c.amount > 0);
+  const snowballItems = [...creditDebts, ...profileDebts].sort((a,b) => a.amount - b.amount);
+  const snowballTarget = snowballItems[0] || null;
+  const totalDebt = snowballItems.reduce((sum, item) => sum + item.amount, 0);
+
+  const currentProfileAbonos = (loanProfiles || [])
+    .flatMap((p) => (p.entries || []))
+    .filter((e) => (e.date || '').slice(0,7) === currentMonth && Number(e.amount) < 0)
+    .reduce((sum, e) => sum + Math.abs(Number(e.amount) || 0), 0);
+
+  const prevProfileAbonos = (loanProfiles || [])
+    .flatMap((p) => (p.entries || []))
+    .filter((e) => (e.date || '').slice(0,7) === prevMonth && Number(e.amount) < 0)
+    .reduce((sum, e) => sum + Math.abs(Number(e.amount) || 0), 0);
+
+  const abonoDiff = currentProfileAbonos - prevProfileAbonos;
+
+  const tips = [];
+
+  if(monthExpenses.length > 0){
+    if(paidRateDiff >= 10){
+      tips.push(`Pagaste más rápido que en ${monthLabel(prevMonth)}: subiste ${paidRateDiff}% en cumplimiento de gastos.`);
+    } else if(paidRateDiff <= -10){
+      tips.push(`Vas ${Math.abs(paidRateDiff)}% por debajo de ${monthLabel(prevMonth)} en pagos al día; conviene priorizar deudas pequeñas.`);
+    } else {
+      tips.push(`Tu ritmo de pagos está estable frente a ${monthLabel(prevMonth)} (${paidRateCurrent}% este mes).`);
+    }
+  }
+
+  if(abonoDiff > 0){
+    tips.push(`Excelente: tus abonos a préstamos subieron ${fmtMoney(abonoDiff)} vs ${monthLabel(prevMonth)}.`);
+  } else if(abonoDiff < 0){
+    tips.push(`Tus abonos bajaron ${fmtMoney(Math.abs(abonoDiff))} vs ${monthLabel(prevMonth)}. Un extra pequeño puede reactivar el avance.`);
+  }
+
+  if(snowballTarget){
+    tips.push(`Bola de nieve sugerida: ataca primero "${snowballTarget.name}" (${fmtMoney(snowballTarget.amount)}).`);
+  } else {
+    tips.push('No detecto deuda activa en este momento. Buen trabajo manteniendo el tablero limpio.');
+  }
+
+  if(dominantCategoryEntry){
+    tips.push(`Tu categoría más pesada del mes es ${dominantCategoryEntry[0]} con ${fmtMoney(dominantCategoryEntry[1])}.`);
+  }
+
+  if(workDaysDiff > 0){
+    tips.push(`Llevas ${workDaysDiff} días trabajados más que en ${monthLabel(prevMonth)}.`);
+  } else if(workDaysDiff < 0){
+    tips.push(`Llevas ${Math.abs(workDaysDiff)} días trabajados menos que en ${monthLabel(prevMonth)}.`);
+  }
+
+  tips.push(balance >= 0
+    ? `Balance positivo de ${fmtMoney(balance)}. Si apartas 10% (${fmtMoney(balance * 0.1)}) aceleras la próxima deuda.`
+    : `Balance negativo de ${fmtMoney(Math.abs(balance))}. Recomiendo congelar gastos no críticos esta semana.`
+  );
+
+  return {
+    tips: tips.filter(Boolean),
+    snowballTarget,
+    totalDebt,
+    paidRateCurrent,
+    paidRatePrev,
+    prevMonth,
+    ingresos,
+    gastos,
+    balance,
+  };
+}
+
+function shuffleArray(items){
+  const arr = [...items];
+  for(let i = arr.length - 1; i > 0; i--){
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+  return arr;
+}
+
+function buildVariedLobitoTips({ tips, snowballTarget, totalDebt, currentMonth }){
+  const base = (tips || []).filter(Boolean);
+  const monthText = monthLabel(currentMonth);
+  const pool = [...base];
+
+  if(snowballTarget){
+    pool.push(`Si enfocas tus extras en ${snowballTarget.name}, ese saldo de ${fmtMoney(snowballTarget.amount)} cae más rápido.`);
+    pool.push(`Prioridad del día: ${snowballTarget.name}. Pequeños abonos constantes hacen gran diferencia.`);
+    pool.push(`Tu objetivo bola de nieve sigue siendo ${snowballTarget.name}. Mantén el impulso este mes.`);
+  }
+
+  if(totalDebt > 0){
+    pool.push(`Tu deuda activa es ${fmtMoney(totalDebt)}. Una meta realista: bajar al menos 5% este mes.`);
+    pool.push(`Tip express: separa un monto fijo semanal para deuda y evita decidirlo cada día.`);
+  }
+
+  pool.push(`En ${monthText}, pagar primero la deuda más pequeña te libera flujo mental y financiero.`);
+  pool.push('Micro-hábito: cada ingreso extra, aunque sea pequeño, divide una parte para deuda.');
+  pool.push('Cuando saldes una deuda, conserva ese mismo pago para la siguiente. Esa es la magia de la bola de nieve.');
+  pool.push('Revisar tus gastos 2 minutos al día evita sorpresas al final del mes.');
+  pool.push('Si dudas entre dos pagos, prioriza el que te permita cerrar una deuda completa más pronto.');
+
+  return Array.from(new Set(pool));
+}
+
 // ------------------ APP ------------------
 export default function App(){
   const [all, setAll] = useState(loadAll);
@@ -490,7 +656,7 @@ function GoogleAuthScreen({ onGoogleLogin, error, disabled = false, message = ''
           <img
             src={logoSrc}
             alt="Mi Nómina"
-            className="w-20 h-20 object-contain"
+            className="lobito-logo-sticker brand-logo w-20 h-20 object-contain"
             onError={(e) => { e.currentTarget.onerror = null; e.currentTarget.style.display = 'none'; }}
           />
           <h1 className="text-2xl font-extrabold tracking-tight">Mi Nómina</h1>
@@ -549,7 +715,7 @@ function Usuario({ user, onSave, onCancel, theme, onToggleTheme }){
           <img
           src={logoSrc}
           alt="Mi Nómina"
-          className="w-14 h-14 object-contain"
+          className="lobito-logo-sticker brand-logo w-14 h-14 object-contain"
             onError={(e) => {
             e.currentTarget.onerror = null;
             e.currentTarget.style.display = "none";
@@ -941,6 +1107,18 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
   const [creditAbonoTargetId, setCreditAbonoTargetId] = useState('');
   const [creditAbonoAmount, setCreditAbonoAmount] = useState('');
   const [creditAbonoMode, setCreditAbonoMode] = useState('cuotas');
+  const [showLobito, setShowLobito] = useState(true);
+
+  const lobitoInsights = useMemo(() => buildLobitoInsights({
+    user,
+    currentMonth,
+    monthExpenses,
+    monthWorkDaysVal,
+    loanProfiles,
+    ingresos,
+    gastos,
+    balance,
+  }), [user, currentMonth, monthExpenses, monthWorkDaysVal, loanProfiles, ingresos, gastos, balance]);
 
   useEffect(()=>{
     if(!loanProfiles.length){
@@ -1070,7 +1248,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
           <img
           src={logoSrc}
           alt="Mi Nómina"
-          className="w-14 h-14 object-contain"
+          className="lobito-logo-sticker brand-logo w-14 h-14 object-contain"
             onError={(e) => {
             e.currentTarget.onerror = null;
             e.currentTarget.style.display = "none";
@@ -1486,25 +1664,152 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
         </div>
       )}
 
+      <LobitoAdvisor
+        logo={logoSrc}
+        isVisible={showLobito}
+        onShow={()=> setShowLobito(true)}
+        onHide={()=> setShowLobito(false)}
+        currentMonth={currentMonth}
+        tips={lobitoInsights.tips}
+        snowballTarget={lobitoInsights.snowballTarget}
+        totalDebt={lobitoInsights.totalDebt}
+      />
+
       <footer className="max-w-6xl mx-auto mt-10 text-xs opacity-60">Local-first • Guarda en tu dispositivo.</footer>
     </div>
   );
 }
 
 // ------------------ UI Components ------------------
+function LobitoAdvisor({ logo, isVisible, onShow, onHide, currentMonth, tips, snowballTarget, totalDebt }){
+  const [activeTip, setActiveTip] = useState('');
+  const tipQueueRef = useRef([]);
+
+  const variedTips = useMemo(() => buildVariedLobitoTips({
+    tips,
+    snowballTarget,
+    totalDebt,
+    currentMonth,
+  }), [tips, snowballTarget, totalDebt, currentMonth]);
+
+  function nextTip(){
+    if(!variedTips.length){
+      setActiveTip('Registra tus gastos y movimientos para que pueda darte consejos más precisos.');
+      return;
+    }
+
+    if(tipQueueRef.current.length === 0){
+      const shuffled = shuffleArray(variedTips);
+      if(shuffled.length > 1 && shuffled[0] === activeTip){
+        const moved = shuffled.shift();
+        shuffled.push(moved);
+      }
+      tipQueueRef.current = shuffled;
+    }
+
+    const next = tipQueueRef.current.shift();
+    if(next) setActiveTip(next);
+  }
+
+  useEffect(() => {
+    if(!isVisible) return;
+    const id = setInterval(() => {
+      nextTip();
+    }, 300000);
+    return () => clearInterval(id);
+  }, [isVisible, variedTips, activeTip]);
+
+  useEffect(() => {
+    tipQueueRef.current = [];
+    setActiveTip('');
+    if(isVisible) nextTip();
+  }, [currentMonth, isVisible, variedTips]);
+
+  const safeActiveTip = activeTip || 'Registra tus gastos y movimientos para que pueda darte consejos más precisos.';
+
+  if(!isVisible){
+    return (
+      <button
+        type="button"
+        onClick={onShow}
+        className="lobito-fab fixed right-4 bottom-4 md:right-8 md:bottom-8 z-40"
+        aria-label="Mostrar lobito financiero"
+      >
+        <img src={logo} alt="Lobito asesor" className="lobito-logo-sticker w-14 h-14 object-contain" />
+      </button>
+    );
+  }
+
+  return (
+    <div className="fixed right-4 bottom-4 md:right-8 md:bottom-8 z-40">
+      <div className="lobito-stack flex items-end gap-2 md:gap-3">
+        <div className="lobito-column space-y-2">
+          <div className="lobito-bubble lobito-bubble-snow">
+            <div className="lobito-bubble-title">Bola de Nieve Recomendada</div>
+            {snowballTarget ? (
+              <>
+                <div className="lobito-bubble-strong">{snowballTarget.name}</div>
+                <div className="lobito-bubble-meta">Saldo pendiente: {fmtMoney(snowballTarget.amount)}</div>
+                <div className="lobito-bubble-meta">Deuda total activa: {fmtMoney(totalDebt)}</div>
+              </>
+            ) : (
+              <div className="lobito-bubble-meta">No hay deudas activas detectadas.</div>
+            )}
+          </div>
+
+          <div className="lobito-bubble lobito-bubble-tip">
+            <div className="lobito-bubble-title">Consejo del Lobito • {monthLabel(currentMonth)}</div>
+            <p className="lobito-bubble-text">{safeActiveTip}</p>
+            <div className="lobito-bubble-actions">
+              <button className="lobito-link-btn" onClick={nextTip}>Otro consejo</button>
+              <button
+                className="lobito-link-btn"
+                onClick={() => {
+                  tipQueueRef.current = [];
+                  nextTip();
+                }}
+              >
+                Variar
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <button type="button" onClick={onHide} className="lobito-fab" aria-label="Ocultar lobito financiero">
+          <img src={logo} alt="Lobito" className="lobito-logo-sticker lobito-avatar w-14 h-14 object-contain" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function CalendarCell({ date, month, user, onOpenDetail }){
   if(!date) return <div className="h-20 rounded-xl border bg-white/40" />;
   const isOtherMonth = date.getMonth() !== month;
   const key = ymd(date);
+  const todayKey = ymd(new Date());
+  const isToday = key === todayKey;
   const workDays = user.workDays.filter(w => w.date === key);
   const indicators = [];
   workDays.forEach(w => { const t = user.dayTypes.find(dt => dt.id === w.typeId); if(t && !indicators.includes(t.color)) indicators.push(t.color); });
   const showIndicators = indicators.slice(0,4);
   const dayIncome = workDays.reduce((acc,w)=> { const t = user.dayTypes.find(dt => dt.id === w.typeId); return acc + (t ? t.rate : (w.value||0)); }, 0);
+
+  const cellClass = [
+    'h-20 rounded-xl border bg-white p-2 flex flex-col justify-between cursor-pointer shadow-sm transition',
+    isOtherMonth ? 'opacity-40' : '',
+    isToday
+      ? 'border-blue-500 ring-2 ring-blue-400/60 bg-blue-50/70 hover:border-blue-500'
+      : 'hover:shadow-md hover:border-slate-400'
+  ].join(' ');
+
   return (
-    <div role="button" tabIndex={0} onKeyDown={(e)=> { if(e.key==='Enter'||e.key===' ') onOpenDetail(key); }} onClick={()=> onOpenDetail(key)} className={`h-20 rounded-xl border bg-white p-2 flex flex-col justify-between ${isOtherMonth? 'opacity-40':''} cursor-pointer shadow-sm hover:shadow-md hover:border-slate-400 transition`}>
+    <div role="button" tabIndex={0} onKeyDown={(e)=> { if(e.key==='Enter'||e.key===' ') onOpenDetail(key); }} onClick={()=> onOpenDetail(key)} className={cellClass}>
       <div className="flex items-center justify-between">
-        <div className="text-xs font-semibold">{date.getDate()}</div>
+        <div className="text-xs font-semibold flex items-center gap-1.5">
+          <span>{date.getDate()}</span>
+          {isToday && <span className="px-1.5 py-0.5 rounded-full text-[9px] leading-none font-bold bg-blue-600 text-white">Hoy</span>}
+        </div>
         <div className="flex gap-1">{showIndicators.map((c,i)=> <span key={i} className="w-3 h-3 rounded-sm border border-slate-200" style={{ background: c }} />)}</div>
       </div>
       <div className="flex items-end justify-between">

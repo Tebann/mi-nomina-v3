@@ -19,6 +19,10 @@
 	--summary-expense-border: #fda4af;
 	--summary-balance-bg: #eff6ff;
 	--summary-balance-border: #93c5fd;
+	--lobito-bubble-bg: #f1f5f9;
+	--lobito-bubble-border: #cbd5e1;
+	--lobito-bubble-text: #0f172a;
+	--lobito-bubble-meta: #334155;
 }
 
 :root[data-theme="dark"] {
@@ -38,6 +42,10 @@
 	--summary-expense-border: #9f1239;
 	--summary-balance-bg: #182230;
 	--summary-balance-border: #334155;
+	--lobito-bubble-bg: #17181d;
+	--lobito-bubble-border: #2a2b31;
+	--lobito-bubble-text: #e6edf7;
+	--lobito-bubble-meta: #cbd5e1;
 	color-scheme: dark;
 }
 
@@ -227,4 +235,188 @@ body {
 .theme-toggle:hover {
 	transform: translateY(-1px) scale(1.01);
 	background: color-mix(in srgb, var(--surface-soft) 88%, transparent);
+}
+
+.lobito-fab {
+	width: 64px;
+	height: 64px;
+	border-radius: 9999px;
+	border: 1px solid var(--border-color);
+	background: color-mix(in srgb, var(--surface) 90%, transparent);
+	box-shadow: 0 12px 24px rgba(0, 0, 0, 0.22);
+	backdrop-filter: blur(10px);
+	animation: lobito-float 2.8s ease-in-out infinite;
+	transition: transform 0.2s ease;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.lobito-fab:hover {
+	transform: translateY(-2px) scale(1.02);
+}
+
+.lobito-stack {
+	position: relative;
+	animation: lobito-rise 220ms ease-out;
+}
+
+.lobito-column {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	width: max-content;
+	max-width: min(72vw, 320px);
+}
+
+.lobito-avatar {
+	animation: lobito-float 2.8s ease-in-out infinite;
+	transform-origin: center bottom;
+}
+
+
+.lobito-logo-sticker {
+	background: transparent;
+	border-radius: 0;
+	padding: 0;
+}
+
+.brand-logo {
+	display: block;
+	object-position: center;
+	transform: translateY(1px);
+}
+
+:root[data-theme="dark"] .lobito-logo-sticker {
+	/* Outline follows the transparent edges of the PNG, like a sticker cut */
+	filter:
+		drop-shadow(1px 0 0 #ffffff)
+		drop-shadow(-1px 0 0 #ffffff)
+		drop-shadow(0 1px 0 #ffffff)
+		drop-shadow(0 -1px 0 #ffffff);
+}
+
+.lobito-bubble {
+	position: relative;
+	border-radius: 18px;
+	padding: 10px 12px;
+	width: fit-content;
+	max-width: min(72vw, 320px);
+	background: var(--lobito-bubble-bg);
+	border: 1px solid var(--lobito-bubble-border);
+	box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+	backdrop-filter: blur(8px);
+	color: var(--lobito-bubble-text);
+}
+
+.lobito-bubble::after {
+	content: "";
+	position: absolute;
+	right: -7px;
+	bottom: 18px;
+	width: 14px;
+	height: 14px;
+	background: var(--lobito-bubble-bg);
+	border-right: 1px solid var(--lobito-bubble-border);
+	border-bottom: 1px solid var(--lobito-bubble-border);
+	transform: rotate(-45deg);
+}
+
+.lobito-bubble-tip::after {
+	bottom: 16px;
+}
+
+.lobito-bubble-snow::after {
+	display: none;
+}
+
+.lobito-bubble-title {
+	font-size: 12px;
+	font-weight: 700;
+	letter-spacing: 0.01em;
+	margin-bottom: 6px;
+	opacity: 0.96;
+}
+
+.lobito-bubble-text {
+	font-size: 15px;
+	line-height: 1.38;
+	font-weight: 500;
+	margin: 0;
+}
+
+.lobito-bubble-meta {
+	margin-top: 6px;
+	font-size: 13px;
+	line-height: 1.34;
+	font-weight: 500;
+	color: var(--lobito-bubble-meta);
+}
+
+.lobito-bubble-strong {
+	font-size: 21px;
+	font-weight: 700;
+	line-height: 1.15;
+}
+
+.lobito-bubble-actions {
+	margin-top: 8px;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	flex-wrap: wrap;
+}
+
+.lobito-link-btn {
+	background: transparent;
+	border: none;
+	padding: 0;
+	font-size: 12px;
+	font-weight: 700;
+	color: var(--lobito-bubble-meta);
+	cursor: pointer;
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+	.lobito-column,
+	.lobito-bubble {
+		max-width: min(82vw, 300px);
+	}
+
+	.lobito-bubble-title {
+		font-size: 11px;
+	}
+
+	.lobito-bubble-text {
+		font-size: 14px;
+	}
+
+	.lobito-bubble-meta {
+		font-size: 12px;
+	}
+
+	.lobito-bubble-strong {
+		font-size: 18px;
+	}
+
+	.lobito-link-btn {
+		font-size: 11px;
+	}
+}
+
+.lobito-link-btn:hover {
+	filter: brightness(1.08);
+}
+
+@keyframes lobito-float {
+	0% { transform: translateY(0px) rotate(0deg); }
+	50% { transform: translateY(-3px) rotate(-1.5deg); }
+	100% { transform: translateY(0px) rotate(0deg); }
+}
+
+@keyframes lobito-rise {
+	0% { opacity: 0; transform: translateY(8px) scale(0.98); }
+	100% { opacity: 1; transform: translateY(0) scale(1); }
 }
