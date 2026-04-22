@@ -99,6 +99,12 @@ function sanitizeSignedAmount(value){
   return n;
 }
 
+function normalizeExpenseStatus(status, paid){
+  const s = (status || '').toString().toLowerCase();
+  if(s === 'pending' || s === 'saved' || s === 'paid') return s;
+  return paid ? 'paid' : 'pending';
+}
+
 function normalizeExpenseKind(kind){
   if(!kind) return 'GASTOS FIJOS';
   const k = kind.toString().toLowerCase();
@@ -167,6 +173,7 @@ function migrateAllData(parsed){
 
     const migratedExpenses = expenses.map(e => {
       const amount = sanitizeAmount(e?.amount);
+      const status = normalizeExpenseStatus(e?.status, e?.paid);
       const legacyKey = getLegacyRecurringKey(e);
       let recurringGroupId = e?.recurringGroupId || '';
 
@@ -179,11 +186,13 @@ function migrateAllData(parsed){
         ...e,
         kind: normalizeExpenseKind(e?.kind),
         amount,
+        status,
         recurringGroupId: recurringGroupId || undefined,
       };
 
       const same = (e?.amount === migrated.amount)
         && (e?.kind === migrated.kind)
+        && (normalizeExpenseStatus(e?.status, e?.paid) === migrated.status)
         && ((e?.recurringGroupId || '') === (migrated.recurringGroupId || ''));
       if(!same) userChanged = true;
       return migrated;
@@ -349,8 +358,8 @@ function buildLobitoInsights({ user, currentMonth, monthExpenses, monthWorkDaysV
   const prevMonth = addMonthsToKey(currentMonth, -1);
   const prevExpenses = user.expenses.filter(e => e.month === prevMonth);
 
-  const paidCurrent = monthExpenses.filter(e => e.paid).length;
-  const paidPrev = prevExpenses.filter(e => e.paid).length;
+  const paidCurrent = monthExpenses.filter(e => e.status === 'paid').length;
+  const paidPrev = prevExpenses.filter(e => e.status === 'paid').length;
   const paidRateCurrent = percent(paidCurrent, monthExpenses.length);
   const paidRatePrev = percent(paidPrev, prevExpenses.length);
   const paidRateDiff = paidRateCurrent - paidRatePrev;
@@ -369,7 +378,7 @@ function buildLobitoInsights({ user, currentMonth, monthExpenses, monthWorkDaysV
   const creditGroups = new Map();
   user.expenses.forEach((e) => {
     if(normalizeExpenseKind(e.kind) !== 'CREDITOS') return;
-    if(e.paid) return;
+    if(e.status === 'paid') return;
     const amount = sanitizeAmount(e.amount);
     if(amount <= 0) return;
 
@@ -827,7 +836,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
 
         newItems.push({
           id: uid(), month: m, date: date || null, concept, amount: amt,
-          kind: normalizedKind, recurring: false, paid: false,
+          kind: normalizedKind, recurring: false, status: 'pending',
           recurringGroupId,
           info: finalInfo, cutoffDate: futureCutoff
         });
@@ -839,7 +848,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
       const recurringGroupId = isRecurring ? uid() : undefined;
       const item = { 
         id: uid(), month: startMonth, date: date||null, concept, amount: amt, 
-        kind: normalizedKind, recurring: isRecurring, paid: false,
+        kind: normalizedKind, recurring: isRecurring, status: 'pending',
         recurringGroupId,
         info: info || '', cutoffDate: cutoffDate || '' 
       };
@@ -881,7 +890,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
 
           return { 
             ...e, ...normalizedFields,
-            id: e.id, month: e.month, date: e.date, paid: e.paid,
+            id: e.id, month: e.month, date: e.date, status: e.status,
             cutoffDate: newCutoff
           };
         }
@@ -904,7 +913,16 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
     });
     updateUserWith({ expenses: filtered });
   }
-  function toggleExpensePaid(id){ updateUserWith({ expenses: user.expenses.map(e=> e.id===id ? { ...e, paid: !e.paid } : e ) }); }
+  function cycleExpenseStatus(id){
+    const statusCycle = { pending: 'saved', saved: 'paid', paid: 'pending' };
+    updateUserWith({
+      expenses: user.expenses.map(e => {
+        if(e.id !== id) return e;
+        const current = normalizeExpenseStatus(e.status, e.paid);
+        return { ...e, status: statusCycle[current] || 'pending' };
+      })
+    });
+  }
 
   // loans by profiles
   function addLoanProfile(name){
@@ -987,7 +1005,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
     const chainKey = getCreditChainKey(expense);
     return user.expenses
       .filter(e => normalizeKind(e.kind) === 'CREDITOS' && getCreditChainKey(e) === chainKey)
-      .reduce((sum, e) => sum + (e.paid ? 0 : sanitizeAmount(e.amount)), 0);
+      .reduce((sum, e) => sum + (e.status === 'paid' ? 0 : sanitizeAmount(e.amount)), 0);
   }
 
   function openCreditAbono(expense){
@@ -1004,7 +1022,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
 
     const chainKey = getCreditChainKey(target);
     const chain = user.expenses.filter(e => normalizeKind(e.kind) === 'CREDITOS' && getCreditChainKey(e) === chainKey);
-    const openItems = chain.filter(e => !e.paid && sanitizeAmount(e.amount) > 0);
+    const openItems = chain.filter(e => e.status !== 'paid' && sanitizeAmount(e.amount) > 0);
     if(openItems.length === 0) return;
 
     let remaining = amount;
@@ -1023,7 +1041,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
         updates.set(e.id, {
           ...cur,
           amount: nextAmount,
-          paid: nextAmount === 0 ? true : cur.paid,
+          status: nextAmount === 0 ? 'paid' : cur.status,
           info: `${cur.info || ''}${nextAmount === 0 ? ' (cuota saldada por abono)' : ''}`.trim(),
         });
       }
@@ -1046,7 +1064,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
           updates.set(e.id, {
             ...cur,
             amount: nextAmount,
-            paid: nextAmount === 0 ? true : cur.paid,
+            status: nextAmount === 0 ? 'paid' : cur.status,
           });
           if(nextAmount > 0) nextActive.push(e);
         }
@@ -1086,7 +1104,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
           if (diff > 0) newCutoff = advanceDateStr(e.cutoffDate, diff);
         }
         
-        const copy = { ...e, id: uid(), month: currentMonth, paid:false, cutoffDate: newCutoff || '' };
+        const copy = { ...e, id: uid(), month: currentMonth, status: 'pending', cutoffDate: newCutoff || '' };
         toAdd.push(copy);
         exists.add(key);
       }
@@ -1362,7 +1380,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
                 const subs = monthExpenses.filter(e=> normalizeKind(e.kind) === 'SUSCRIPCIONES').slice().sort((a,b)=> b.amount - a.amount);
                 const totalCreditsRemaining = user.expenses
                   .filter(e => normalizeKind(e.kind) === 'CREDITOS')
-                  .reduce((sum, e) => sum + (e.paid ? 0 : sanitizeAmount(e.amount)), 0);
+                  .reduce((sum, e) => sum + (e.status === 'paid' ? 0 : sanitizeAmount(e.amount)), 0);
 
                 const Section = ({ title, items, titleBg }) => {
                   const total = items.reduce((s, it) => s + (sanitizeAmount(it.amount) || 0), 0);
@@ -1382,8 +1400,8 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
                             </thead>
                             <tbody>
                               {items.map(e => (
-                                <tr key={e.id} className={`border-t ${e.paid ? 'bg-emerald-50' : ''}`}>
-                                  <td className={`px-3 py-2 align-middle min-w-0 w-[50%] ${e.paid ? 'text-emerald-800' : ''}`}>
+                                <tr key={e.id} className={`border-t ${e.status === 'paid' ? 'bg-emerald-50' : e.status === 'saved' ? 'bg-amber-50' : ''}`}>
+                                  <td className={`px-3 py-2 align-middle min-w-0 w-[50%] ${e.status === 'paid' ? 'text-emerald-800' : e.status === 'saved' ? 'text-amber-800' : ''}`}>
                                       <div className="flex flex-col min-w-0">
                                         <div className="text-sm font-semibold whitespace-normal break-words">{e.concept}</div>
                                         {(e.cutoffDate || e.info || normalizeKind(e.kind) === 'CREDITOS') && (
@@ -1400,17 +1418,21 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
                                         )}
                                       </div>
                                     </td>
-                                  <td className={`px-3 py-2 align-middle text-right text-sm whitespace-nowrap w-[18%] ${e.paid ? 'text-emerald-800' : ''}`}>{fmtMoney(e.amount)}</td>
+                                  <td className={`px-3 py-2 align-middle text-right text-sm whitespace-nowrap w-[18%] ${e.status === 'paid' ? 'text-emerald-800' : e.status === 'saved' ? 'text-amber-800' : ''}`}>{fmtMoney(e.amount)}</td>
                                   <td className="px-4 py-3 align-middle text-center overflow-visible w-[32%]">
                                     <div className="inline-flex items-center justify-center gap-1.5 whitespace-nowrap">
-                                      <button title={"Pago"} aria-label="marcar-pagado" onClick={()=> toggleExpensePaid(e.id)} className={("w-7 h-7 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 "+(e.paid ? "bg-green-100 border-green-300":"bg-white border-slate-300"))}>
-                                        {e.paid ? (
+                                      <button title={e.status === 'paid' ? 'Pagado' : e.status === 'saved' ? 'Dinero guardado' : 'Pendiente'} aria-label="cambiar-estado" onClick={()=> cycleExpenseStatus(e.id)} className={("w-7 h-7 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 "+(e.status === 'paid' ? "bg-green-100 border-green-300" : e.status === 'saved' ? "bg-amber-100 border-amber-300" : "bg-white border-slate-300"))}>
+                                        {e.status === 'paid' ? (
                                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-green-700">
                                             <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                                           </svg>
+                                        ) : e.status === 'saved' ? (
+                                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-amber-700">
+                                            <path d="M12 2L4 6v6c0 5 8 7 8 7s8-2 8-7V6l-8-4z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                                          </svg>
                                         ) : (
                                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-slate-700">
-                                            <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                                           </svg>
                                         )}
                                       </button>
@@ -1462,12 +1484,12 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
 
                         <div className="md:hidden bg-white space-y-2 p-3">
                           {items.map(e => (
-                            <div key={e.id} className={`rounded-lg border p-3 flex flex-col ${e.paid ? 'bg-emerald-50 border-emerald-200' : 'bg-white border-slate-200'}`}>
+                            <div key={e.id} className={`rounded-lg border p-3 flex flex-col ${e.status === 'paid' ? 'bg-emerald-50 border-emerald-200' : e.status === 'saved' ? 'bg-amber-50 border-amber-200' : 'bg-white border-slate-200'}`}>
                               <div className="flex items-start justify-between mb-2">
                                 <div className="flex-1 min-w-0">
-                                  <div className={`font-semibold text-sm truncate ${e.paid ? 'text-emerald-800' : ''}`}>{e.concept}</div>
+                                  <div className={`font-semibold text-sm truncate ${e.status === 'paid' ? 'text-emerald-800' : e.status === 'saved' ? 'text-amber-800' : ''}`}>{e.concept}</div>
                                   {(e.cutoffDate || e.info || normalizeKind(e.kind) === 'CREDITOS') && (
-                                    <div className={`text-xs opacity-60 mt-1 leading-snug ${e.paid ? 'text-emerald-700' : ''}`}>
+                                    <div className={`text-xs opacity-60 mt-1 leading-snug ${e.status === 'paid' ? 'text-emerald-700' : e.status === 'saved' ? 'text-amber-700' : ''}`}>
                                       {e.cutoffDate && <div>{formatTextDate(e.cutoffDate)}</div>}
                                       {(e.info || normalizeKind(e.kind) === 'CREDITOS') && (
                                         <div className="whitespace-nowrap overflow-hidden text-ellipsis">
@@ -1481,16 +1503,20 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, the
                                 </div>
                               </div>
                               <div className="flex items-center justify-between">
-                                <div className={`text-lg font-bold ${e.paid ? 'text-emerald-700' : ''}`}>{fmtMoney(e.amount)}</div>
+                                <div className={`text-lg font-bold ${e.status === 'paid' ? 'text-emerald-700' : e.status === 'saved' ? 'text-amber-700' : ''}`}>{fmtMoney(e.amount)}</div>
                                 <div className="flex gap-1.5">
-                                  <button title={"Pago"} aria-label="marcar-pagado" onClick={()=> toggleExpensePaid(e.id)} className={("w-6 h-6 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 text-xs "+(e.paid ? "bg-green-100 border-green-300":"bg-white border-slate-300"))}>
-                                    {e.paid ? (
+                                  <button title={e.status === 'paid' ? 'Pagado' : e.status === 'saved' ? 'Dinero guardado' : 'Pendiente'} aria-label="cambiar-estado" onClick={()=> cycleExpenseStatus(e.id)} className={("w-6 h-6 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 text-xs "+(e.status === 'paid' ? "bg-green-100 border-green-300" : e.status === 'saved' ? "bg-amber-100 border-amber-300" : "bg-white border-slate-300"))}>
+                                    {e.status === 'paid' ? (
                                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-green-700">
                                         <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                                       </svg>
+                                    ) : e.status === 'saved' ? (
+                                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-amber-700">
+                                        <path d="M12 2L4 6v6c0 5 8 7 8 7s8-2 8-7V6l-8-4z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                                      </svg>
                                     ) : (
                                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-slate-700">
-                                        <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                        <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                                       </svg>
                                     )}
                                   </button>
