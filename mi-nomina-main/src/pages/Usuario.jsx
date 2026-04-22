@@ -20,7 +20,7 @@ export default function Usuario({ user, onSave, onCancel }) {
   }
 
   return (
-    <div className="min-h-screen bg-[#F6F2EA] p-6">
+    <div className="app-shell min-h-screen bg-transparent p-6">
       <div className="max-w-5xl mx-auto bg-white rounded-2xl shadow p-6">
         <div className="flex items-center justify-between mb-6">
           <h2 className="text-2xl font-bold">Perfil de Usuario</h2>

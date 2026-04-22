@@ -1,7 +1,9 @@
 // App.jsx
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import jsPDF from "jspdf";
 import logoSrc from "./assets/logo.png";
+import { hasFirebaseConfig } from "./lib/firebase";
+import { loadCloudData, saveCloudData, signInWithGoogle, signOutGoogle, watchAuth } from "./lib/cloudStore";
 
 /*
   App.jsx - Versión actualizada
@@ -13,12 +15,31 @@ import logoSrc from "./assets/logo.png";
 */
 
 const ALL_KEY = "miNomina_v2";
+const THEME_KEY = "miNomina_theme";
+const CLOUD_MIGRATION_PREFIX = "miNomina_cloud_migrated_";
+const BACKUP_PREFIX = `${ALL_KEY}_backup_`;
 const MONTHS_ES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
 const DAYS_SHORT = ["Dom","Lun","Mar","Mié","Jue","Vie","Sáb"];
 const currency = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 });
+const compactNumber = new Intl.NumberFormat("es-CO", { notation: "compact", maximumFractionDigits: 1 });
 
 function fmtMoney(n){ return currency.format(Math.round(n||0)); }
-function ymd(d = new Date()){ return new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString().slice(0,10); }
+function fmtMoneyCompact(n){
+  const x = Math.round(n || 0);
+  if (Math.abs(x) < 1000) return fmtMoney(x);
+  return `$${compactNumber.format(x)}`;
+}
+function ymd(d = new Date()){
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+function parseYmdLocal(dateStr){
+  if(!dateStr) return new Date();
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
+}
 function monthKey(y,m){ const mm = (m+1).toString().padStart(2,'0'); return `${y}-${mm}`; }
 function startOfMonth(y,m){ return new Date(y,m,1); }
 function daysInMonth(y,m){ return new Date(y,m+1,0).getDate(); }
@@ -42,23 +63,528 @@ function buildMonthMatrix(y,m){
 }
 function uid(){ if(typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID(); return `${Date.now()}-${Math.floor(Math.random()*100000)}`; }
 
+function formatTextDate(dateStr) {
+  if (!dateStr) return '';
+  const [y, m, d] = dateStr.split('-');
+  // Usamos el arreglo MONTHS_ES que ya tienes (ej: "Marzo")
+  return `${Number(d)} de ${MONTHS_ES[Number(m) - 1]} del ${y}`;
+}
+
+function addMonthsToKey(yyyyMm, add) {
+  const [y, m] = yyyyMm.split('-').map(Number);
+  const date = new Date(y, m - 1 + add, 1);
+  return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}`;
+}
+
+function advanceDateStr(dateStr, addMonths) {
+  if (!dateStr) return '';
+  const [y, m, d] = dateStr.split('-');
+  const date = new Date(y, Number(m) - 1 + addMonths, Number(d));
+  return ymd(date);
+}
+
+function sanitizeAmount(value){
+  const raw = String(value ?? '').trim();
+  if(!raw) return 0;
+  const n = Number.parseInt(raw.replace(/[^\d-]/g, ''), 10);
+  if(!Number.isFinite(n)) return 0;
+  return Math.max(0, n);
+}
+
+function sanitizeSignedAmount(value){
+  const raw = String(value ?? '').trim();
+  if(!raw) return 0;
+  const n = Number.parseInt(raw.replace(/[^\d-]/g, ''), 10);
+  if(!Number.isFinite(n)) return 0;
+  return n;
+}
+
+function normalizeExpenseKind(kind){
+  if(!kind) return 'GASTOS FIJOS';
+  const k = kind.toString().toLowerCase();
+  if(/credit|credt|credito|creditos/.test(k)) return 'CREDITOS';
+  if(/suscrip|suscripci|subscription/.test(k)) return 'SUSCRIPCIONES';
+  if(/fij|fijo|gasto/.test(k)) return 'GASTOS FIJOS';
+  return k === 'variable' ? 'GASTOS FIJOS' : kind.toString().toUpperCase();
+}
+
+function baseInfoForGrouping(info){
+  const i = (info || '').toString();
+  return i.replace(/\s*\(?\s*cuota\s*\d+\s*\/\s*\d+\s*\)?/ig, '').trim().toLowerCase();
+}
+
+function getLegacyRecurringKey(expense){
+  if(!expense) return '';
+  const isInstallment = /cuota\s*\d+\s*\/\s*\d+/i.test((expense.info || '').toString());
+  const recurringType = expense.recurring ? 'siempre' : (isInstallment ? 'cuotas' : '');
+  if(!recurringType) return '';
+
+  const concept = (expense.concept || '').toString().trim().toLowerCase();
+  const kind = normalizeExpenseKind(expense.kind);
+  const amount = sanitizeAmount(expense.amount);
+  const cutoffDay = (expense.cutoffDate || '').toString().slice(8,10);
+  const infoBase = baseInfoForGrouping(expense.info);
+  return [recurringType, concept, kind, amount, cutoffDay, infoBase].join('|');
+}
+
+function withBackupIfNeeded(raw){
+  try{
+    const now = new Date();
+    const stamp = [
+      now.getFullYear().toString(),
+      (now.getMonth() + 1).toString().padStart(2, '0'),
+      now.getDate().toString().padStart(2, '0'),
+      now.getHours().toString().padStart(2, '0'),
+      now.getMinutes().toString().padStart(2, '0'),
+      now.getSeconds().toString().padStart(2, '0')
+    ].join('');
+    const key = `${BACKUP_PREFIX}${stamp}`;
+    if(!localStorage.getItem(key)) localStorage.setItem(key, raw);
+
+    const keys = Object.keys(localStorage).filter(k => k.startsWith(BACKUP_PREFIX)).sort();
+    const maxBackups = 3;
+    if(keys.length > maxBackups){
+      keys.slice(0, keys.length - maxBackups).forEach(k => localStorage.removeItem(k));
+    }
+  }catch(_){ }
+}
+
+function migrateAllData(parsed){
+  const base = {
+    users: Array.isArray(parsed?.users) ? parsed.users : [],
+    currentUserId: parsed?.currentUserId ?? null
+  };
+
+  let changed = !Array.isArray(parsed?.users) || !Object.prototype.hasOwnProperty.call(parsed || {}, 'currentUserId');
+
+  const users = base.users.map(u => {
+    const expenses = Array.isArray(u?.expenses) ? u.expenses : [];
+    const legacyLoans = Array.isArray(u?.loans) ? u.loans : [];
+    const hadLoanProfiles = Array.isArray(u?.loanProfiles);
+    const seedLegacyLoans = hadLoanProfiles ? [] : legacyLoans;
+    const recurringGroupMap = new Map();
+    let userChanged = !Array.isArray(u?.expenses);
+
+    const migratedExpenses = expenses.map(e => {
+      const amount = sanitizeAmount(e?.amount);
+      const legacyKey = getLegacyRecurringKey(e);
+      let recurringGroupId = e?.recurringGroupId || '';
+
+      if(!recurringGroupId && legacyKey){
+        if(!recurringGroupMap.has(legacyKey)) recurringGroupMap.set(legacyKey, `legacy-${uid()}`);
+        recurringGroupId = recurringGroupMap.get(legacyKey);
+      }
+
+      const migrated = {
+        ...e,
+        kind: normalizeExpenseKind(e?.kind),
+        amount,
+        recurringGroupId: recurringGroupId || undefined,
+      };
+
+      const same = (e?.amount === migrated.amount)
+        && (e?.kind === migrated.kind)
+        && ((e?.recurringGroupId || '') === (migrated.recurringGroupId || ''));
+      if(!same) userChanged = true;
+      return migrated;
+    });
+
+    if(userChanged){
+      changed = true;
+      return {
+        ...u,
+        expenses: migratedExpenses,
+        loanProfiles: normalizeLoanProfiles(Array.isArray(u?.loanProfiles) ? u.loanProfiles : [], seedLegacyLoans),
+      };
+    }
+
+    const nextLoanProfiles = normalizeLoanProfiles(Array.isArray(u?.loanProfiles) ? u.loanProfiles : [], seedLegacyLoans);
+    if(!hadLoanProfiles || JSON.stringify(u.loanProfiles) !== JSON.stringify(nextLoanProfiles)){
+      changed = true;
+      return { ...u, loanProfiles: nextLoanProfiles };
+    }
+
+    return u;
+  });
+
+  return { data: { ...base, users }, changed };
+}
+
+function sanitizeLoanProfileName(name){
+  const clean = (name || '').toString().trim();
+  return clean || 'Sin perfil';
+}
+
+function normalizeLoanProfiles(loanProfiles, legacyLoans){
+  const toEntry = (entry, fallbackDate) => ({
+    id: entry?.id || uid(),
+    amount: sanitizeSignedAmount(entry?.amount),
+    date: (entry?.date || fallbackDate || ymd(new Date())).toString().slice(0,10),
+    concept: (entry?.concept || 'Sin concepto').toString().trim() || 'Sin concepto'
+  });
+
+  // Preserve each existing profile as-is by id (no merging by name),
+  // so user data like "Amor General" keeps all original movements.
+  const normalizedProfiles = (loanProfiles || []).map(p => {
+    const entries = Array.isArray(p?.entries) ? p.entries : [];
+    return {
+      id: p?.id || uid(),
+      name: sanitizeLoanProfileName(p?.name),
+      entries: entries.map(e => toEntry(e))
+    };
+  });
+
+  // Import legacy loans only as seed data and append to an existing profile name when found.
+  (legacyLoans || []).forEach(l => {
+    const name = sanitizeLoanProfileName(l?.person);
+    const normalized = toEntry(
+      { amount: l?.amount, concept: l?.concept || 'Saldo migrado', date: l?.date },
+      l?.date
+    );
+
+    const idx = normalizedProfiles.findIndex(p => p.name.toLowerCase() === name.toLowerCase());
+    if(idx >= 0){
+      normalizedProfiles[idx] = {
+        ...normalizedProfiles[idx],
+        entries: [...normalizedProfiles[idx].entries, normalized]
+      };
+    } else {
+      normalizedProfiles.push({ id: uid(), name, entries: [normalized] });
+    }
+  });
+
+  return normalizedProfiles.map(p => {
+    const seen = new Set();
+    const dedupedEntries = (p.entries || []).filter(e => {
+      const concept = (e.concept || '').toString().trim().toLowerCase();
+      if(concept !== 'saldo migrado') return true;
+      const sig = `${concept}|${e.date}|${sanitizeAmount(e.amount)}`;
+      if(seen.has(sig)) return false;
+      seen.add(sig);
+      return true;
+    });
+
+    return {
+      ...p,
+      entries: dedupedEntries.slice().sort((a,b)=> b.date.localeCompare(a.date))
+    };
+  });
+}
+
 function defaultUser(email, password){
   return {
     id: uid(), email, password, 
     profile: { fullName:'', cedula:'', correo:'', usuarioName:'', empresa:'', nit:'', ciudad:'Pereira', concepto:'Mesero', signatureDataUrl:'' },
-    workDays: [], expenses: [], loans: [],
+    workDays: [], expenses: [], loans: [], loanProfiles: [],
     dayTypes: [ { id: uid(), name: 'Medio tiempo', place:'', rate:30150, color:'#60a5fa' }, { id: uid(), name: 'Tiempo completo', place:'', rate:60300, color:'#f97316' } ]
   };
 }
 
-function loadAll(){ try{ const raw = localStorage.getItem(ALL_KEY); if(!raw) return { users:[], currentUserId:null }; return JSON.parse(raw); }catch{ return { users:[], currentUserId:null }; } }
+function loadAll(){
+  try{
+    const raw = localStorage.getItem(ALL_KEY);
+    if(!raw) return { users:[], currentUserId:null };
+
+    const parsed = JSON.parse(raw);
+    const migrated = migrateAllData(parsed);
+    if(migrated.changed){
+      withBackupIfNeeded(raw);
+      saveAll(migrated.data);
+    }
+    return migrated.data;
+  }catch{
+    return { users:[], currentUserId:null };
+  }
+}
 function saveAll(x){ localStorage.setItem(ALL_KEY, JSON.stringify(x)); }
+
+function mapAuthError(err){
+  const code = err?.code || '';
+  const message = err?.message || '';
+  if(code === 'auth/unauthorized-domain') return 'Dominio no autorizado en Firebase Auth. Agrega localhost y tebann.github.io en Authorized domains.';
+  if(code === 'auth/operation-not-allowed') return 'Google no está habilitado en Firebase Authentication > Sign-in method.';
+  if(code === 'auth/invalid-api-key' || code.includes('api-key-not-valid')) return 'API key inválida para Firebase Auth. Revisa VITE_FIREBASE_API_KEY en .env y en GitHub Secrets.';
+  if(code === 'auth/popup-blocked') return 'El navegador bloqueó la ventana emergente. Habilita popups para este sitio.';
+  if(code === 'auth/popup-closed-by-user') return 'Cerraste la ventana de inicio de sesión antes de completar el acceso.';
+  if(code === 'auth/cancelled-popup-request') return 'Ya hay una solicitud de login en curso. Intenta de nuevo.';
+  if(code === 'auth/network-request-failed') return 'Fallo de red al conectar con Firebase. Revisa tu conexión.';
+  if(code || message) return `No se pudo iniciar sesión con Google. ${code ? `Código: ${code}. ` : ''}${message ? `Detalle: ${message}` : ''}`;
+  return 'No se pudo iniciar sesión con Google.';
+}
+
+function mapCloudSyncError(err){
+  const code = err?.code || '';
+  if(code === 'permission-denied') return 'Firestore rechazó permisos. Revisa las reglas y que estés autenticado.';
+  if(code === 'unavailable') return 'Firestore no está disponible temporalmente. Intenta de nuevo.';
+  return `No se pudo sincronizar con la nube.${code ? ` (${code})` : ''}`;
+}
+
+function getInitialTheme(){
+  try{
+    const saved = localStorage.getItem(THEME_KEY);
+    if(saved === 'dark' || saved === 'light') return saved;
+  }catch(_){ }
+  return 'light';
+}
+
+function monthLabel(yyyyMm){
+  const [y, m] = (yyyyMm || '').split('-').map(Number);
+  if(!y || !m) return 'mes actual';
+  return `${MONTHS_ES[m - 1]} ${y}`;
+}
+
+function percent(part, total){
+  if(!total) return 0;
+  return Math.round((part / total) * 100);
+}
+
+function buildCreditChainKey(expense){
+  if(expense?.recurringGroupId) return `rg:${expense.recurringGroupId}`;
+  const legacy = getLegacyRecurringKey(expense);
+  if(legacy) return `lg:${legacy}`;
+  return `id:${expense?.id || ''}`;
+}
+
+function buildLobitoInsights({ user, currentMonth, monthExpenses, monthWorkDaysVal, loanProfiles, ingresos, gastos, balance }){
+  const prevMonth = addMonthsToKey(currentMonth, -1);
+  const prevExpenses = user.expenses.filter(e => e.month === prevMonth);
+
+  const paidCurrent = monthExpenses.filter(e => e.status === 'paid').length;
+  const paidPrev = prevExpenses.filter(e => e.status === 'paid').length;
+  const paidRateCurrent = percent(paidCurrent, monthExpenses.length);
+  const paidRatePrev = percent(paidPrev, prevExpenses.length);
+  const paidRateDiff = paidRateCurrent - paidRatePrev;
+
+  const currentWorkDays = monthWorkDaysVal.length;
+  const prevWorkDays = user.workDays.filter(w => w.date.slice(0,7) === prevMonth).length;
+  const workDaysDiff = currentWorkDays - prevWorkDays;
+
+  const categoryTotals = monthExpenses.reduce((acc, e) => {
+    const k = normalizeExpenseKind(e.kind);
+    acc[k] = (acc[k] || 0) + sanitizeAmount(e.amount);
+    return acc;
+  }, {});
+  const dominantCategoryEntry = Object.entries(categoryTotals).sort((a,b) => b[1] - a[1])[0];
+
+  const creditGroups = new Map();
+  user.expenses.forEach((e) => {
+    if(normalizeExpenseKind(e.kind) !== 'CREDITOS') return;
+    if(e.status === 'paid') return;
+    const amount = sanitizeAmount(e.amount);
+    if(amount <= 0) return;
+
+    const key = buildCreditChainKey(e);
+    const found = creditGroups.get(key) || { type: 'credito', name: e.concept || 'Crédito', amount: 0 };
+    found.amount += amount;
+    if(!found.cutoff && e.cutoffDate) found.cutoff = e.cutoffDate;
+    creditGroups.set(key, found);
+  });
+
+  const profileDebts = (loanProfiles || [])
+    .map((p) => ({
+      type: 'perfil',
+      name: p.name,
+      amount: (p.entries || []).reduce((a,b) => a + (Number(b.amount) || 0), 0)
+    }))
+    .filter((p) => p.amount > 0);
+
+  const creditDebts = Array.from(creditGroups.values()).filter((c) => c.amount > 0);
+  const snowballItems = [...creditDebts, ...profileDebts].sort((a,b) => a.amount - b.amount);
+  const snowballTarget = snowballItems[0] || null;
+  const totalDebt = snowballItems.reduce((sum, item) => sum + item.amount, 0);
+
+  const currentProfileAbonos = (loanProfiles || [])
+    .flatMap((p) => (p.entries || []))
+    .filter((e) => (e.date || '').slice(0,7) === currentMonth && Number(e.amount) < 0)
+    .reduce((sum, e) => sum + Math.abs(Number(e.amount) || 0), 0);
+
+  const prevProfileAbonos = (loanProfiles || [])
+    .flatMap((p) => (p.entries || []))
+    .filter((e) => (e.date || '').slice(0,7) === prevMonth && Number(e.amount) < 0)
+    .reduce((sum, e) => sum + Math.abs(Number(e.amount) || 0), 0);
+
+  const abonoDiff = currentProfileAbonos - prevProfileAbonos;
+
+  const tips = [];
+
+  if(monthExpenses.length > 0){
+    if(paidRateDiff >= 10){
+      tips.push(`Pagaste más rápido que en ${monthLabel(prevMonth)}: subiste ${paidRateDiff}% en cumplimiento de gastos.`);
+    } else if(paidRateDiff <= -10){
+      tips.push(`Vas ${Math.abs(paidRateDiff)}% por debajo de ${monthLabel(prevMonth)} en pagos al día; conviene priorizar deudas pequeñas.`);
+    } else {
+      tips.push(`Tu ritmo de pagos está estable frente a ${monthLabel(prevMonth)} (${paidRateCurrent}% este mes).`);
+    }
+  }
+
+  if(abonoDiff > 0){
+    tips.push(`Excelente: tus abonos a préstamos subieron ${fmtMoney(abonoDiff)} vs ${monthLabel(prevMonth)}.`);
+  } else if(abonoDiff < 0){
+    tips.push(`Tus abonos bajaron ${fmtMoney(Math.abs(abonoDiff))} vs ${monthLabel(prevMonth)}. Un extra pequeño puede reactivar el avance.`);
+  }
+
+  if(snowballTarget){
+    tips.push(`Bola de nieve sugerida: ataca primero "${snowballTarget.name}" (${fmtMoney(snowballTarget.amount)}).`);
+  } else {
+    tips.push('No detecto deuda activa en este momento. Buen trabajo manteniendo el tablero limpio.');
+  }
+
+  if(dominantCategoryEntry){
+    tips.push(`Tu categoría más pesada del mes es ${dominantCategoryEntry[0]} con ${fmtMoney(dominantCategoryEntry[1])}.`);
+  }
+
+  if(workDaysDiff > 0){
+    tips.push(`Llevas ${workDaysDiff} días trabajados más que en ${monthLabel(prevMonth)}.`);
+  } else if(workDaysDiff < 0){
+    tips.push(`Llevas ${Math.abs(workDaysDiff)} días trabajados menos que en ${monthLabel(prevMonth)}.`);
+  }
+
+  tips.push(balance >= 0
+    ? `Balance positivo de ${fmtMoney(balance)}. Si apartas 10% (${fmtMoney(balance * 0.1)}) aceleras la próxima deuda.`
+    : `Balance negativo de ${fmtMoney(Math.abs(balance))}. Recomiendo congelar gastos no críticos esta semana.`
+  );
+
+  return {
+    tips: tips.filter(Boolean),
+    snowballTarget,
+    totalDebt,
+    paidRateCurrent,
+    paidRatePrev,
+    prevMonth,
+    ingresos,
+    gastos,
+    balance,
+  };
+}
+
+function shuffleArray(items){
+  const arr = [...items];
+  for(let i = arr.length - 1; i > 0; i--){
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+  return arr;
+}
+
+function buildVariedLobitoTips({ tips, snowballTarget, totalDebt, currentMonth }){
+  const base = (tips || []).filter(Boolean);
+  const monthText = monthLabel(currentMonth);
+  const pool = [...base];
+
+  if(snowballTarget){
+    pool.push(`Si enfocas tus extras en ${snowballTarget.name}, ese saldo de ${fmtMoney(snowballTarget.amount)} cae más rápido.`);
+    pool.push(`Prioridad del día: ${snowballTarget.name}. Pequeños abonos constantes hacen gran diferencia.`);
+    pool.push(`Tu objetivo bola de nieve sigue siendo ${snowballTarget.name}. Mantén el impulso este mes.`);
+  }
+
+  if(totalDebt > 0){
+    pool.push(`Tu deuda activa es ${fmtMoney(totalDebt)}. Una meta realista: bajar al menos 5% este mes.`);
+    pool.push(`Tip express: separa un monto fijo semanal para deuda y evita decidirlo cada día.`);
+  }
+
+  pool.push(`En ${monthText}, pagar primero la deuda más pequeña te libera flujo mental y financiero.`);
+  pool.push('Micro-hábito: cada ingreso extra, aunque sea pequeño, divide una parte para deuda.');
+  pool.push('Cuando saldes una deuda, conserva ese mismo pago para la siguiente. Esa es la magia de la bola de nieve.');
+  pool.push('Revisar tus gastos 2 minutos al día evita sorpresas al final del mes.');
+  pool.push('Si dudas entre dos pagos, prioriza el que te permita cerrar una deuda completa más pronto.');
+
+  return Array.from(new Set(pool));
+}
 
 // ------------------ APP ------------------
 export default function App(){
   const [all, setAll] = useState(loadAll);
-  const [view, setView] = useState('app'); // app | profile | login
+  const [theme, setTheme] = useState(getInitialTheme);
+  const [view, setView] = useState('app'); // app | profile
+  const [googleUser, setGoogleUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [cloudReady, setCloudReady] = useState(false);
+  const [authErr, setAuthErr] = useState('');
+  const lastCloudSnapshotRef = useRef('');
+
   useEffect(()=> saveAll(all), [all]);
+
+  useEffect(()=>{
+    try{
+      document.documentElement.setAttribute('data-theme', theme);
+      localStorage.setItem(THEME_KEY, theme);
+    }catch(_){ }
+  }, [theme]);
+
+  useEffect(()=>{
+    if(!hasFirebaseConfig){
+      setAuthReady(true);
+      setCloudReady(false);
+      return;
+    }
+
+    const unsub = watchAuth(async(user)=>{
+      setGoogleUser(user);
+      setAuthReady(true);
+      setAuthErr('');
+
+      if(!user){
+        setCloudReady(false);
+        return;
+      }
+
+      try{
+        const localAll = loadAll();
+        const cloudAll = await loadCloudData(user.uid);
+        let next = cloudAll ? migrateAllData(cloudAll).data : migrateAllData(localAll).data;
+
+        if(!cloudAll){
+          if(!next.users.length){
+            const seeded = defaultUser(user.email || '', 'GOOGLE');
+            next = { users:[seeded], currentUserId: seeded.id };
+          } else if(!next.currentUserId){
+            const byEmail = next.users.find(u => (u.email || '').toLowerCase() === (user.email || '').toLowerCase());
+            next = { ...next, currentUserId: byEmail?.id || next.users[0]?.id || null };
+          }
+          await saveCloudData(user.uid, next);
+          try{ localStorage.setItem(`${CLOUD_MIGRATION_PREFIX}${user.uid}`, '1'); }catch(_){ }
+        }
+
+        if(user.email){
+          const existing = next.users.find(u => (u.email || '').toLowerCase() === user.email.toLowerCase());
+          if(existing){
+            next = { ...next, currentUserId: existing.id };
+          } else {
+            const seeded = defaultUser(user.email, 'GOOGLE');
+            next = { ...next, users:[...next.users, seeded], currentUserId: seeded.id };
+            await saveCloudData(user.uid, next);
+          }
+        }
+
+        setAll(next);
+        lastCloudSnapshotRef.current = JSON.stringify(next);
+        setCloudReady(true);
+      }catch(e){
+        try{ console.error('Cloud sync error:', e); }catch(_){ }
+        setAuthErr(mapCloudSyncError(e));
+        setCloudReady(false);
+      }
+    });
+
+    return ()=> unsub && unsub();
+  }, []);
+
+  useEffect(()=>{
+    if(!hasFirebaseConfig || !googleUser || !cloudReady) return;
+    const serialized = JSON.stringify(all);
+    if(serialized === lastCloudSnapshotRef.current) return;
+
+    const timer = setTimeout(async()=>{
+      try{
+        await saveCloudData(googleUser.uid, all);
+        lastCloudSnapshotRef.current = serialized;
+      }catch(_){ }
+    }, 500);
+
+    return ()=> clearTimeout(timer);
+  }, [all, cloudReady, googleUser]);
 
   function replaceUser(newUser){
     setAll(s=>{
@@ -77,70 +603,119 @@ export default function App(){
     });
   }
 
-  function registerAndLogin(email, password){ setAll(s=> { const u = defaultUser(email,password); return { ...s, users:[...s.users,u], currentUserId: u.id }; }); setView('app'); }
-  function loginWith(email,password){ setAll(s=> { const f = s.users.find(u => u.email === email && u.password === password); if(!f) return s; return { ...s, currentUserId: f.id }; }); setView('app'); }
-
   const currentUser = all.users.find(u => u.id === all.currentUserId) || null;
 
-  if(!currentUser || view === 'login') return <AuthScreen onLogin={loginWith} onRegister={registerAndLogin} />;
-  if(view === 'profile') return <Usuario user={currentUser} onSave={(profile)=>{ patchCurrentUser({ profile }); setView('app'); }} onCancel={()=> setView('app')} />;
+  async function handleGoogleLogin(){
+    try{
+      setAuthErr('');
+      await signInWithGoogle();
+    }catch(e){
+      try{ console.error('Google auth error:', e); }catch(_){ }
+      setAuthErr(mapAuthError(e));
+    }
+  }
 
-  return <MainApp user={currentUser} replaceUser={replaceUser} patchCurrentUser={patchCurrentUser} onLogout={()=> setAll(s=> ({ ...s, currentUserId:null }))} goProfile={()=> setView('profile')} />;
+  async function handleLogout(){
+    try{
+      await signOutGoogle();
+      setView('app');
+      setAll({ users:[], currentUserId:null });
+    }catch(_){ }
+  }
+
+  function toggleTheme(){
+    setTheme(prev => prev === 'dark' ? 'light' : 'dark');
+  }
+
+  let content = null;
+  if(!hasFirebaseConfig){
+    content = <GoogleAuthScreen disabled message="Falta configurar Firebase. Crea un archivo .env con tus llaves y reinicia la app." onGoogleLogin={handleGoogleLogin} error={authErr} />;
+  } else if(!authReady){
+    content = <LoadingScreen text="Preparando autenticación..." />;
+  } else if(!googleUser){
+    content = <GoogleAuthScreen onGoogleLogin={handleGoogleLogin} error={authErr} />;
+  } else if(!cloudReady){
+    content = <LoadingScreen text="Sincronizando tus datos..." />;
+  } else if(!currentUser){
+    content = <LoadingScreen text="Preparando tu perfil..." />;
+  } else if(view === 'profile'){
+    content = <Usuario user={currentUser} onSave={(profile)=>{ patchCurrentUser({ profile }); setView('app'); }} onCancel={()=> setView('app')} theme={theme} onToggleTheme={toggleTheme} />;
+  } else {
+    content = <MainApp user={currentUser} replaceUser={replaceUser} patchCurrentUser={patchCurrentUser} onLogout={handleLogout} goProfile={()=> setView('profile')} theme={theme} onToggleTheme={toggleTheme} />;
+  }
+
+  return content;
 }
 
 // ------------------ AUTH ------------------
-function AuthScreen({ onLogin, onRegister }){
-  const [mode, setMode] = useState('login');
-  const [email,setEmail]=useState('');
-  const [password,setPassword]=useState('');
-  const [err,setErr]=useState('');
-  function doLogin(){ if(!email||!password) return setErr('Completa correo y contraseña'); onLogin(email,password); }
-  function doRegister(){ if(!email||!password) return setErr('Completa correo y contraseña'); onRegister(email,password); }
+function GoogleAuthScreen({ onGoogleLogin, error, disabled = false, message = '' }){
   return (
-    <div className="min-h-screen bg-[#F6F2EA] p-4 md:p-8 flex items-center justify-center">
+    <div className="app-shell min-h-screen bg-transparent p-4 md:p-8 flex items-center justify-center">
       <div className="max-w-md w-full bg-white rounded-2xl p-6 shadow-[0_10px_30px_rgba(0,0,0,0.08)] border border-slate-200">
         <div className="text-center mb-4 flex flex-col items-center justify-center">
           <img
             src={logoSrc}
             alt="Mi Nómina"
-            className="w-20 h-20 object-contain"
+            className="lobito-logo-sticker brand-logo w-20 h-20 object-contain"
             onError={(e) => { e.currentTarget.onerror = null; e.currentTarget.style.display = 'none'; }}
           />
           <h1 className="text-2xl font-extrabold tracking-tight">Mi Nómina</h1>
         </div>
 
-        <div className="flex justify-center gap-2 mb-4">
-          <button className={`px-3 py-1 rounded-lg border border-slate-300 ${mode==='login'?'bg-black text-white':''}`} onClick={()=>{setMode('login');setErr('');}}>Iniciar sesión</button>
-          <button className={`px-3 py-1 rounded-lg border border-slate-300 ${mode==='register'?'bg-black text-white':''}`} onClick={()=>{setMode('register');setErr('');}}>Crear cuenta</button>
-        </div>
-
         <div className="space-y-3">
-          <input className="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="Correo" value={email} onChange={e=> setEmail(e.target.value)} />
-          <input className="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="Contraseña" type="password" value={password} onChange={e=> setPassword(e.target.value)} />
-          {err && <div className="text-red-600 text-xs text-center">{err}</div>}
-          {mode==='login'
-            ? <button className="w-full bg-slate-900 text-white rounded-xl py-2.5 font-semibold shadow hover:bg-slate-800" onClick={doLogin}>Entrar</button>
-            : <button className="w-full bg-slate-900 text-white rounded-xl py-2.5 font-semibold shadow hover:bg-slate-800" onClick={doRegister}>Registrarme</button>}
+          {message && <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">{message}</div>}
+          {error && <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-900">{error}</div>}
+          <button disabled={disabled} className="w-full bg-slate-900 text-white rounded-xl py-2.5 font-semibold shadow hover:bg-slate-800 disabled:opacity-60 disabled:cursor-not-allowed" onClick={onGoogleLogin}>Continuar con Google</button>
         </div>
 
-        <p className="text-xs opacity-60 mt-3 text-center">* Datos guardados solo en este dispositivo.</p>
+        <p className="text-xs opacity-60 mt-3 text-center">Tus datos se sincronizan con tu cuenta de Google en la nube.</p>
       </div>
     </div>
   );
 }
 
+function LoadingScreen({ text }){
+  return (
+    <div className="app-shell min-h-screen bg-transparent p-4 md:p-8 flex items-center justify-center">
+      <div className="max-w-md w-full bg-white rounded-2xl p-6 shadow-[0_10px_30px_rgba(0,0,0,0.08)] border border-slate-200 text-center">
+        <div className="text-sm opacity-70">{text || 'Cargando...'}</div>
+      </div>
+    </div>
+  );
+}
+
+function ThemeToggleButton({ theme, onToggle }){
+  const nextTheme = theme === 'dark' ? 'light' : 'dark';
+  const label = nextTheme === 'dark' ? 'Cambiar a modo oscuro' : 'Cambiar a modo claro';
+
+  return (
+    <button type="button" className="theme-toggle" onClick={onToggle} title={label} aria-label={label}>
+      {nextTheme === 'dark' ? (
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
+          <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      ) : (
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
+          <circle cx="12" cy="12" r="4.2" stroke="currentColor" strokeWidth="1.8" />
+          <path d="M12 2.5v2.2M12 19.3v2.2M4.7 4.7l1.6 1.6M17.7 17.7l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.7 19.3l1.6-1.6M17.7 6.3l1.6-1.6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
 // ------------------ USUARIO ------------------
-function Usuario({ user, onSave, onCancel }){
+function Usuario({ user, onSave, onCancel, theme, onToggleTheme }){
   const [form, setForm] = useState({ ...user.profile });
   useEffect(()=> setForm({ ...user.profile }), [user]);
   return (
-    <div className="min-h-screen bg-[#F6F2EA] p-4 md:p-8 text-slate-900">
+    <div className="app-shell min-h-screen bg-transparent p-4 md:p-8 text-slate-900">
       <header className="max-w-6xl mx-auto flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">
           <img
           src={logoSrc}
           alt="Mi Nómina"
-          className="w-14 h-14 object-contain"
+          className="lobito-logo-sticker brand-logo w-14 h-14 object-contain"
             onError={(e) => {
             e.currentTarget.onerror = null;
             e.currentTarget.style.display = "none";
@@ -149,7 +724,7 @@ function Usuario({ user, onSave, onCancel }){
           <h1 className="text-2xl font-bold tracking-tight">Usuario</h1>
         </div>
         <div className="flex gap-2 items-center">
-          <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={onCancel}>Cancelar</button>
+          <ThemeToggleButton theme={theme} onToggle={onToggleTheme} />
         </div>
       </header>
 
@@ -199,7 +774,7 @@ function Usuario({ user, onSave, onCancel }){
 }
 
 // ------------------ MAIN APP ------------------
-function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
+function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile, theme, onToggleTheme }){
   const today = new Date();
   const [ym,setYm]=useState({ year: today.getFullYear(), month: today.getMonth() });
   const currentMonth = monthKey(ym.year, ym.month);
@@ -209,16 +784,13 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
 
   const monthWorkDays = useMemo(()=> user.workDays.filter(d=> d.date.slice(0,7) === currentMonth), [user.workDays, currentMonth]);
   const monthExpenses = useMemo(()=> user.expenses.filter(e=> e.month === currentMonth), [user.expenses, currentMonth]);
+  const loanProfiles = useMemo(()=> {
+    const existing = Array.isArray(user.loanProfiles) ? user.loanProfiles : [];
+    const legacy = existing.length === 0 && Array.isArray(user.loans) ? user.loans : [];
+    return normalizeLoanProfiles(existing, legacy);
+  }, [user.loanProfiles, user.loans]);
 
-  function normalizeKind(kind){
-    if(!kind) return 'GASTOS FIJOS';
-    const k = kind.toString().toLowerCase();
-    if(/credit|credt|credito|creditos/.test(k)) return 'CREDITOS';
-    if(/suscrip|suscripci|subscription/.test(k)) return 'SUSCRIPCIONES';
-    if(/fij|fijo|gasto/.test(k)) return 'GASTOS FIJOS';
-    // fallback: keep original but normalized to fixed
-    return k === 'variable' ? 'GASTOS FIJOS' : kind.toString().toUpperCase();
-  }
+  function normalizeKind(kind){ return normalizeExpenseKind(kind); }
 
   const monthWorkDaysVal = useMemo(()=> monthWorkDays.map(w=> {
     const t = user.dayTypes.find(dt=> dt.id === w.typeId);
@@ -226,7 +798,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
   }), [monthWorkDays, user.dayTypes]);
 
   const ingresos = monthWorkDaysVal.reduce((a,b)=> a + (b.__value||0), 0);
-  const gastos = monthExpenses.reduce((a,b)=> a + (b.amount||0), 0);
+  const gastos = monthExpenses.reduce((a,b)=> a + (Number(b.amount)||0), 0);
   const balance = ingresos - gastos;
 
   const q1Total = useMemo(()=> monthWorkDaysVal.filter(w => Number(w.date.split("-")[2]) <= 15).reduce((a,b)=> a + (b.__value||0),0), [monthWorkDaysVal]);
@@ -237,44 +809,258 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
   function deleteWorkDay(id){ if(!confirm('Eliminar este día trabajado?')) return; updateUserWith({ workDays: user.workDays.filter(w=> w.id !== id) }); }
 
   // expenses CRUD
-  function addExpense({ concept, amount, kind, recurring, date }){
-    const month = date ? date.slice(0,7) : currentMonth;
-    const item = { id: uid(), month, date: date||null, concept, amount: Number(amount)||0, kind: kind||'GASTOS FIJOS', recurring: !!recurring, paid:false };
-    updateUserWith({ expenses: [item, ...user.expenses] });
+  function addExpense(form) {
+    const { concept, amount, kind, recurrenceType, installments, date, info, cutoffDate } = form;
+    const startMonth = date ? date.slice(0,7) : currentMonth;
+    const amt = sanitizeAmount(amount);
+    const normalizedKind = normalizeExpenseKind(kind);
+
+    if (recurrenceType === 'cuotas' && installments > 1) {
+      // Generar gastos para N cuotas
+      const newItems = [];
+      const recurringGroupId = uid();
+      for(let i=0; i<installments; i++){
+        const m = addMonthsToKey(startMonth, i);
+        const futureCutoff = advanceDateStr(cutoffDate, i);
+        const quotaInfo = `Cuota ${i+1}/${installments}`;
+        const finalInfo = info ? `${info} (${quotaInfo})` : quotaInfo;
+
+        newItems.push({
+          id: uid(), month: m, date: date || null, concept, amount: amt,
+          kind: normalizedKind, recurring: false, status: 'pending',
+          recurringGroupId,
+          info: finalInfo, cutoffDate: futureCutoff
+        });
+      }
+      updateUserWith({ expenses: [...newItems, ...user.expenses] });
+    } else {
+      // Gasto único o recurrente para siempre
+      const isRecurring = recurrenceType === 'siempre';
+      const recurringGroupId = isRecurring ? uid() : undefined;
+      const item = { 
+        id: uid(), month: startMonth, date: date||null, concept, amount: amt, 
+        kind: normalizedKind, recurring: isRecurring, status: 'pending',
+        recurringGroupId,
+        info: info || '', cutoffDate: cutoffDate || '' 
+      };
+      updateUserWith({ expenses: [item, ...user.expenses] });
+    }
+  }
+
+  function editExpense(id, updatedFields) {
+    const original = user.expenses.find(e => e.id === id);
+    if (!original) return;
+
+    const normalizedFields = {
+      ...updatedFields,
+      kind: normalizeExpenseKind(updatedFields.kind),
+      amount: updatedFields.amount !== undefined ? sanitizeAmount(updatedFields.amount) : undefined,
+    };
+
+    const hasGroup = !!original.recurringGroupId;
+    const legacyKey = !hasGroup ? getLegacyRecurringKey(original) : '';
+
+    updateUserWith({
+      expenses: user.expenses.map(e => {
+        if (e.id === id) {
+          return { ...e, ...normalizedFields };
+        }
+
+        const sameRecurringChain = hasGroup
+          ? e.recurringGroupId && e.recurringGroupId === original.recurringGroupId
+          : (legacyKey && getLegacyRecurringKey(e) === legacyKey);
+
+        if (sameRecurringChain && e.month > original.month) {
+          let newCutoff = e.cutoffDate;
+          if (normalizedFields.cutoffDate) {
+            const [y1, m1] = original.month.split('-').map(Number);
+            const [y2, m2] = e.month.split('-').map(Number);
+            const diff = (y2 - y1) * 12 + (m2 - m1);
+            newCutoff = advanceDateStr(normalizedFields.cutoffDate, diff);
+          }
+
+          return { 
+            ...e, ...normalizedFields,
+            id: e.id, month: e.month, date: e.date, status: e.status || 'pending',
+            cutoffDate: newCutoff
+          };
+        }
+        return e;
+      })
+    });
   }
 
   function deleteExpense(id){
     if(!confirm('Eliminar este gasto?')) return;
     const target = user.expenses.find(e => e.id === id);
     if(!target){ return; }
-    const key = (target.concept || '') + '|' + (target.amount||0);
-    // remove all expenses that match the same concept|amount (this avoids recurring templates
-    // re-adding the item later).
-    const filtered = user.expenses.filter(e => (e.concept || '') + '|' + (e.amount||0) !== key);
-    try{
-      const newUser = { ...user, expenses: filtered };
-      replaceUser(newUser);
-      patchCurrentUser({ expenses: filtered });
-    }catch(e){
-      updateUserWith({ expenses: filtered });
-    }
-    try{ console.debug('deleteExpense -> removed key', key, 'remaining', filtered.length); }catch(_){ }
-  }
-  function toggleExpensePaid(id){ updateUserWith({ expenses: user.expenses.map(e=> e.id===id ? { ...e, paid: !e.paid } : e ) }); }
 
-  // loans
-  function addLoan({ person, amount, date }){ const item = { id: uid(), person, amount: Number(amount)||0, date: date || new Date().toISOString().slice(0,10), settled:false }; updateUserWith({ loans: [item, ...user.loans] }); }
-  function deleteLoan(id){ if(!confirm('Eliminar este préstamo?')) return; updateUserWith({ loans: user.loans.filter(l => l.id !== id) }); }
-  function settleLoan(id){ updateUserWith({ loans: user.loans.map(l => l.id === id ? { ...l, settled: !l.settled } : l) }); }
-  function abonarLoan(id, amount){
-    const amt = Number(amount) || 0;
-    if(amt <= 0) return alert('Ingresa un valor válido para abonar.');
-    const newLoans = user.loans.map(l => {
-      if(l.id !== id) return l;
-      const remaining = Math.max(0, l.amount - amt);
-      return { ...l, amount: remaining, settled: remaining === 0 ? true : l.settled };
+    const groupId = target.recurringGroupId;
+    const legacyKey = !groupId ? getLegacyRecurringKey(target) : '';
+    const filtered = user.expenses.filter(e => {
+      if(groupId) return e.recurringGroupId !== groupId;
+      if(legacyKey) return getLegacyRecurringKey(e) !== legacyKey;
+      return e.id !== id;
     });
-    updateUserWith({ loans: newLoans });
+    updateUserWith({ expenses: filtered });
+  }
+  function cycleExpenseStatus(id){ 
+    const statusCycle = { pending: 'saved', saved: 'paid', paid: 'pending' };
+    updateUserWith({ expenses: user.expenses.map(e=> e.id===id ? { ...e, status: statusCycle[e.status] || 'pending' } : e ) }); 
+  }
+
+  // loans by profiles
+  function addLoanProfile(name){
+    const clean = sanitizeLoanProfileName(name);
+    const exists = loanProfiles.some(p => p.name.toLowerCase() === clean.toLowerCase());
+    if(exists) return alert('Ese perfil ya existe.');
+    const item = { id: uid(), name: clean, entries: [] };
+    updateUserWith({ loanProfiles: [item, ...loanProfiles] });
+  }
+
+  function addLoanEntry({ profileId, amount, date, concept }){
+    const amt = sanitizeAmount(amount);
+    if(amt <= 0) return alert('Ingresa un monto valido.');
+    const next = loanProfiles.map(p => {
+      if(p.id !== profileId) return p;
+      const entry = {
+        id: uid(),
+        amount: amt,
+        date: (date || ymd(new Date())).toString().slice(0,10),
+        concept: (concept || 'Sin concepto').trim() || 'Sin concepto'
+      };
+      return { ...p, entries: [entry, ...(p.entries || [])] };
+    });
+    updateUserWith({ loanProfiles: next });
+  }
+
+  function abonarLoanProfile({ profileId, amount, date, concept }){
+    const requested = sanitizeAmount(amount);
+    if(requested <= 0) return alert('Ingresa un valor valido para abonar.');
+
+    const profile = loanProfiles.find(p => p.id === profileId);
+    if(!profile) return;
+
+    const currentTotal = (profile.entries || []).reduce((a,b)=> a + (Number(b.amount) || 0), 0);
+    if(currentTotal <= 0) return alert('Este perfil no tiene saldo pendiente para abonar.');
+
+    const applied = Math.min(requested, currentTotal);
+    const next = loanProfiles.map(p => {
+      if(p.id !== profileId) return p;
+      const entry = {
+        id: uid(),
+        amount: -applied,
+        date: (date || ymd(new Date())).toString().slice(0,10),
+        concept: (concept || 'Abono').trim() || 'Abono'
+      };
+      return { ...p, entries: [entry, ...(p.entries || [])] };
+    });
+    updateUserWith({ loanProfiles: next });
+  }
+
+  function deleteLoanEntry(profileId, entryId){
+    if(!confirm('Eliminar este movimiento del perfil?')) return;
+    const next = loanProfiles.map(p => {
+      if(p.id !== profileId) return p;
+      return { ...p, entries: (p.entries || []).filter(e => e.id !== entryId) };
+    });
+    updateUserWith({ loanProfiles: next });
+  }
+
+  function deleteLoanProfile(profileId){
+    const profile = loanProfiles.find(p => p.id === profileId);
+    if(!profile) return;
+    if(!confirm(`Eliminar el perfil "${profile.name}" y todos sus movimientos?`)) return;
+    const next = loanProfiles.filter(p => p.id !== profileId);
+    updateUserWith({ loanProfiles: next });
+    if(selectedLoanProfileId === profileId){
+      setSelectedLoanProfileId(next[0]?.id || '');
+    }
+  }
+
+  function getCreditChainKey(expense){
+    if(expense?.recurringGroupId) return `rg:${expense.recurringGroupId}`;
+    const legacy = getLegacyRecurringKey(expense);
+    if(legacy) return `lg:${legacy}`;
+    return `id:${expense?.id || ''}`;
+  }
+
+  function getCreditRemaining(expense){
+    if(normalizeKind(expense?.kind) !== 'CREDITOS') return 0;
+    const chainKey = getCreditChainKey(expense);
+    return user.expenses
+      .filter(e => normalizeKind(e.kind) === 'CREDITOS' && getCreditChainKey(e) === chainKey)
+      .reduce((sum, e) => sum + (e.status === 'paid' ? 0 : sanitizeAmount(e.amount)), 0);
+  }
+
+  function openCreditAbono(expense){
+    setCreditAbonoTargetId(expense.id);
+    setCreditAbonoAmount('');
+    setCreditAbonoMode('cuotas');
+    setShowCreditAbonoModal(true);
+  }
+
+  function applyCreditAbono(){
+    const target = user.expenses.find(e => e.id === creditAbonoTargetId);
+    const amount = sanitizeAmount(creditAbonoAmount);
+    if(!target || amount <= 0) return;
+
+    const chainKey = getCreditChainKey(target);
+    const chain = user.expenses.filter(e => normalizeKind(e.kind) === 'CREDITOS' && getCreditChainKey(e) === chainKey);
+    const openItems = chain.filter(e => e.status !== 'paid' && sanitizeAmount(e.amount) > 0);
+    if(openItems.length === 0) return;
+
+    let remaining = amount;
+    const updates = new Map();
+    openItems.forEach(e => updates.set(e.id, { ...e, amount: sanitizeAmount(e.amount) }));
+
+    if(creditAbonoMode === 'cuotas'){
+      const ordered = [...openItems].sort((a,b)=> b.month.localeCompare(a.month));
+      for(const e of ordered){
+        if(remaining <= 0) break;
+        const cur = updates.get(e.id);
+        const curAmount = sanitizeAmount(cur.amount);
+        const reduce = Math.min(curAmount, remaining);
+        const nextAmount = curAmount - reduce;
+        remaining -= reduce;
+        updates.set(e.id, {
+          ...cur,
+          amount: nextAmount,
+          status: nextAmount === 0 ? 'paid' : cur.status,
+          info: `${cur.info || ''}${nextAmount === 0 ? ' (cuota saldada por abono)' : ''}`.trim(),
+        });
+      }
+    } else {
+      let active = [...openItems].sort((a,b)=> a.month.localeCompare(b.month));
+      while(remaining > 0 && active.length){
+        const base = Math.max(1, Math.floor(remaining / active.length));
+        const nextActive = [];
+        for(const e of active){
+          if(remaining <= 0){
+            nextActive.push(e);
+            continue;
+          }
+          const cur = updates.get(e.id);
+          const curAmount = sanitizeAmount(cur.amount);
+          if(curAmount <= 0) continue;
+          const reduce = Math.min(curAmount, base, remaining);
+          const nextAmount = curAmount - reduce;
+          remaining -= reduce;
+          updates.set(e.id, {
+            ...cur,
+            amount: nextAmount,
+            status: nextAmount === 0 ? 'paid' : cur.status,
+          });
+          if(nextAmount > 0) nextActive.push(e);
+        }
+        active = nextActive;
+      }
+    }
+
+    updateUserWith({
+      expenses: user.expenses.map(e => updates.get(e.id) || e)
+    });
+    setShowCreditAbonoModal(false);
   }
 
   // day types
@@ -284,14 +1070,26 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
   // copy recurring expenses when month changes
   // Only copy expenses explicitly marked `recurring` to avoid re-adding
   // items that exist in other months (was causing deleted items to reappear).
+// copy recurring expenses when month changes
   useEffect(()=>{
-    const exists = new Set(user.expenses.filter(e=> e.month === currentMonth).map(e=> e.concept + '|' + e.amount));
+    const recurringKey = (e) => e.recurringGroupId || getLegacyRecurringKey(e) || `${(e.concept||'').toLowerCase()}|${normalizeExpenseKind(e.kind)}|${sanitizeAmount(e.amount)}`;
+    const exists = new Set(user.expenses.filter(e=> e.month === currentMonth).map(e=> recurringKey(e)));
     const recurringAll = user.expenses.filter(e=> e.recurring);
     const toAdd = [];
     recurringAll.forEach(e=>{
-      const key = e.concept + '|' + e.amount;
+      if(e.month > currentMonth) return;
+      const key = recurringKey(e);
       if(!exists.has(key)){
-        const copy = { ...e, id: uid(), month: currentMonth, paid:false };
+        // Calcular diferencia de meses para avanzar la fecha de corte
+        let newCutoff = e.cutoffDate;
+        if (e.cutoffDate) {
+          const [y1, m1] = e.month.split('-').map(Number);
+          const [y2, m2] = currentMonth.split('-').map(Number);
+          const diff = (y2 - y1) * 12 + (m2 - m1);
+          if (diff > 0) newCutoff = advanceDateStr(e.cutoffDate, diff);
+        }
+        
+        const copy = { ...e, id: uid(), month: currentMonth, status: 'pending', cutoffDate: newCutoff || '' };
         toAdd.push(copy);
         exists.add(key);
       }
@@ -305,6 +1103,34 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
   const [invoiceQ, setInvoiceQ] = useState(1);
   const [invoiceAmount, setInvoiceAmount] = useState(0);
   const [showExpenseModal, setShowExpenseModal] = useState(false);
+  const [showLoanModal, setShowLoanModal] = useState(false);
+  const [selectedLoanProfileId, setSelectedLoanProfileId] = useState('');
+  const [expenseToEdit, setExpenseToEdit] = useState(null); // NUEVO ESTADO
+  const [showCreditAbonoModal, setShowCreditAbonoModal] = useState(false);
+  const [creditAbonoTargetId, setCreditAbonoTargetId] = useState('');
+  const [creditAbonoAmount, setCreditAbonoAmount] = useState('');
+  const [creditAbonoMode, setCreditAbonoMode] = useState('cuotas');
+  const [showLobito, setShowLobito] = useState(true);
+
+  const lobitoInsights = useMemo(() => buildLobitoInsights({
+    user,
+    currentMonth,
+    monthExpenses,
+    monthWorkDaysVal,
+    loanProfiles,
+    ingresos,
+    gastos,
+    balance,
+  }), [user, currentMonth, monthExpenses, monthWorkDaysVal, loanProfiles, ingresos, gastos, balance]);
+
+  useEffect(()=>{
+    if(!loanProfiles.length){
+      setSelectedLoanProfileId('');
+      return;
+    }
+    if(selectedLoanProfileId && loanProfiles.some(p => p.id === selectedLoanProfileId)) return;
+    setSelectedLoanProfileId(loanProfiles[0].id);
+  }, [loanProfiles, selectedLoanProfileId]);
 
   function openInvoiceModal(){ setInvoiceQ(1); setInvoiceAmount(q1Total); setShowInvoice(true); }
   function selectInvoiceQ(q){ setInvoiceQ(q); setInvoiceAmount(q === 1 ? q1Total : q2Total); }
@@ -419,13 +1245,13 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
   const [showTypesModal, setShowTypesModal] = useState(false);
 
   return (
-    <div className="min-h-screen bg-[#F6F2EA] p-4 md:p-8 text-slate-900">
+    <div className="app-shell min-h-screen bg-transparent p-4 md:p-8 text-slate-900">
       <header className="max-w-6xl mx-auto flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">
           <img
           src={logoSrc}
           alt="Mi Nómina"
-          className="w-14 h-14 object-contain"
+          className="lobito-logo-sticker brand-logo w-14 h-14 object-contain"
             onError={(e) => {
             e.currentTarget.onerror = null;
             e.currentTarget.style.display = "none";
@@ -437,13 +1263,17 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
           <span className="opacity-80 hidden sm:inline">{user.profile?.fullName || user.email}</span>
           <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={goProfile}>Usuario</button>
           <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={onLogout}>Salir</button>
+          <ThemeToggleButton theme={theme} onToggle={onToggleTheme} />
         </div>
       </header>
 
       <section className="max-w-6xl mx-auto mb-6">
         <div className="rounded-2xl border border-slate-200 bg-white p-4 grid grid-cols-1 sm:grid-cols-4 gap-3 items-center shadow-[0_10px_30px_rgba(0,0,0,0.06)]">
           <div className="col-span-1 sm:col-span-1">
-            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(16,185,129,0.06)]" style={{ background: '#ECFDF3' }}>
+            <div
+              className="rounded-xl p-4 shadow-[0_8px_20px_rgba(16,185,129,0.09)] text-center sm:text-left"
+              style={{ background: 'var(--summary-income-bg)', border: '1px solid var(--summary-income-border)' }}
+            >
               <div className="text-sm opacity-70">Ingresos</div>
               <div className="text-2xl font-extrabold tracking-tight text-emerald-700">{fmtMoney(ingresos)}</div>
               <div className="text-xs opacity-60">{monthWorkDays.length} días</div>
@@ -451,7 +1281,10 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
           </div>
 
           <div className="col-span-1 sm:col-span-1">
-            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(239,68,68,0.04)]" style={{ background: '#FEF2F2' }}>
+            <div
+              className="rounded-xl p-4 shadow-[0_8px_20px_rgba(239,68,68,0.08)] text-center sm:text-left"
+              style={{ background: 'var(--summary-expense-bg)', border: '1px solid var(--summary-expense-border)' }}
+            >
               <div className="text-sm opacity-70">Gastos</div>
               <div className="text-2xl font-extrabold tracking-tight text-rose-700">{fmtMoney(gastos)}</div>
               <div className="text-xs opacity-60">{monthExpenses.length} gastos</div>
@@ -459,7 +1292,10 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
           </div>
 
           <div className="col-span-1 sm:col-span-1">
-            <div className="rounded-xl p-4 shadow-[0_8px_20px_rgba(59,130,246,0.04)]" style={{ background: '#EFF6FF' }}>
+            <div
+              className="rounded-xl p-4 shadow-[0_8px_20px_rgba(59,130,246,0.09)] text-center sm:text-left"
+              style={{ background: 'var(--summary-balance-bg)', border: '1px solid var(--summary-balance-border)' }}
+            >
               <div className="text-sm opacity-70">Balance</div>
               <div className="text-2xl font-extrabold tracking-tight text-sky-700">{fmtMoney(balance)}</div>
               <div className="text-xs opacity-60">{balance>=0 ? 'Ahorro' : 'Déficit'}</div>
@@ -475,7 +1311,7 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
         </div>
       </section>
 
-      <main className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <main className="max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-6">
         <section className="space-y-6">
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-[0_8px_24px_rgba(0,0,0,0.06)]">
             <div className="flex items-center justify-between mb-3">
@@ -493,16 +1329,31 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
 
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-[0_8px_24px_rgba(0,0,0,0.06)]">
             <div className="text-lg font-bold mb-2">Préstamos</div>
-            <LoanPanel loans={user.loans} onAdd={addLoan} onToggle={settleLoan} onDelete={deleteLoan} onAbonar={abonarLoan} />
+            <LoanProfilesSummary
+              profiles={loanProfiles}
+              onOpenProfile={(profileId)=> { setSelectedLoanProfileId(profileId); setShowLoanModal(true); }}
+              onDeleteProfile={deleteLoanProfile}
+              onCreateProfile={()=> {
+                const name = prompt('Nombre del nuevo perfil');
+                if(!name || !name.trim()) return;
+                const clean = sanitizeLoanProfileName(name);
+                const exists = loanProfiles.some(p => p.name.toLowerCase() === clean.toLowerCase());
+                if(exists) return alert('Ese perfil ya existe.');
+                const newProfile = { id: uid(), name: clean, entries: [] };
+                updateUserWith({ loanProfiles: [newProfile, ...loanProfiles] });
+              }}
+            />
           </div>
+
         </section>
 
         <section className="space-y-6">
+
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-[0_8px_24px_rgba(0,0,0,0.06)]">
             <div className="flex items-center justify-between mb-2">
               <div className="text-lg font-bold">Gastos del mes</div>
               <div>
-                <button className="px-4 py-2 rounded-xl bg-slate-900 text-white font-semibold shadow hover:bg-slate-800" onClick={()=> setShowExpenseModal(true)}>Agregar Gasto</button>
+                <button className="px-4 py-2 rounded-xl bg-slate-900 text-white font-semibold shadow hover:bg-slate-800" onClick={()=> { setExpenseToEdit(null); setShowExpenseModal(true); }}>Agregar Gasto</button>
               </div>
             </div>
             <div className="space-y-4">
@@ -512,69 +1363,191 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
                 const credits = monthExpenses.filter(e=> normalizeKind(e.kind) === 'CREDITOS').slice().sort((a,b)=> b.amount - a.amount);
                 const fixed = monthExpenses.filter(e=> normalizeKind(e.kind) === 'GASTOS FIJOS').slice().sort((a,b)=> b.amount - a.amount);
                 const subs = monthExpenses.filter(e=> normalizeKind(e.kind) === 'SUSCRIPCIONES').slice().sort((a,b)=> b.amount - a.amount);
+                const totalCreditsRemaining = user.expenses
+                  .filter(e => normalizeKind(e.kind) === 'CREDITOS')
+                  .reduce((sum, e) => sum + (e.status === 'paid' ? 0 : sanitizeAmount(e.amount)), 0);
 
                 const Section = ({ title, items, titleBg }) => {
-                  const total = items.reduce((s, it) => s + (Number(it.amount) || 0), 0);
+                  const total = items.reduce((s, it) => s + (sanitizeAmount(it.amount) || 0), 0);
+                  const isCredits = title === 'CREDITOS';
+                  
                   return (
-                      <div className="rounded-lg border border-slate-200 overflow-hidden">
-                        <div className={`px-4 py-2 text-sm font-bold leading-tight text-center ${titleBg} text-white`}>{title}</div>
-                      <div className="bg-white">
+                    <div className="rounded-lg border border-slate-200 overflow-hidden">
+                      <div className={`px-4 py-2 text-sm font-bold leading-tight text-center ${titleBg} text-white`}>{title}</div>
+                      <div className="hidden md:block bg-white">
                         <table className="w-full table-fixed">
-                          <thead>
-                            <tr className="text-sm text-left">
-                              <th className="px-4 py-2 w-1/2">Concepto</th>
-                              <th className="px-4 py-2 w-1/4 text-right">Precio</th>
-                              <th className="px-4 py-2 w-1/4 text-center">Acciones</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {items.map(e => (
-                              <tr key={e.id} className={`border-t ${e.paid ? 'bg-emerald-50' : ''}`}>
-                                  <td className={`px-3 py-2 align-middle min-w-0 ${e.paid ? 'text-emerald-800' : ''}`}>
-                                    <div className="flex items-center gap-3 min-w-0">
-                                      <div className="text-sm font-semibold truncate">{e.concept}</div>
+                            <thead>
+                              <tr className="text-sm text-left">
+                                <th className="px-4 py-2 w-[50%]">Concepto</th>
+                                <th className="px-4 py-2 w-[18%] text-right">Precio</th>
+                                <th className="px-4 py-2 w-[32%] text-center">Acciones</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {items.map(e => (
+                                <tr key={e.id} className={`border-t ${e.status === 'paid' ? 'bg-emerald-50' : e.status === 'saved' ? 'bg-amber-50' : ''}`}>
+                                  <td className={`px-3 py-2 align-middle min-w-0 w-[50%] ${e.status === 'paid' ? 'text-emerald-800' : e.status === 'saved' ? 'text-amber-800' : ''}`}>
+                                      <div className="flex flex-col min-w-0">
+                                        <div className="text-sm font-semibold whitespace-normal break-words">{e.concept}</div>
+                                        {(e.cutoffDate || e.info || normalizeKind(e.kind) === 'CREDITOS') && (
+                                          <div className="text-xs opacity-60 mt-0.5 leading-snug">
+                                            {e.cutoffDate && <div>{formatTextDate(e.cutoffDate)}</div>}
+                                            {(e.info || normalizeKind(e.kind) === 'CREDITOS') && (
+                                              <div className="whitespace-nowrap overflow-hidden text-ellipsis">
+                                                {normalizeKind(e.kind) === 'CREDITOS'
+                                                  ? `${e.info || ''}${e.info ? ' - ' : ''}Faltan: ${fmtMoney(getCreditRemaining(e))}`
+                                                  : (e.info || '')}
+                                              </div>
+                                            )}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </td>
+                                  <td className={`px-3 py-2 align-middle text-right text-sm whitespace-nowrap w-[18%] ${e.status === 'paid' ? 'text-emerald-800' : e.status === 'saved' ? 'text-amber-800' : ''}`}>{fmtMoney(e.amount)}</td>
+                                  <td className="px-4 py-3 align-middle text-center overflow-visible w-[32%]">
+                                    <div className="inline-flex items-center justify-center gap-1.5 whitespace-nowrap">
+                                      <button title={e.status === 'paid' ? "Pagado" : e.status === 'saved' ? "Dinero Guardado" : "Pendiente"} aria-label="cambiar-estado" onClick={()=> cycleExpenseStatus(e.id)} className={`w-7 h-7 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 transition ${e.status === 'paid' ? "bg-green-100 border-green-300" : e.status === 'saved' ? "bg-amber-100 border-amber-300" : "bg-slate-100 border-slate-300"}`}>
+                                        {e.status === 'paid' ? (
+                                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-green-700">
+                                            <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                          </svg>
+                                        ) : e.status === 'saved' ? (
+                                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-amber-700">
+                                            <path d="M12 2L4 6v6c0 5 8 7 8 7s8-2 8-7V6l-8-4z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                                          </svg>
+                                        ) : (
+                                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-slate-700">
+                                            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                          </svg>
+                                        )}
+                                      </button>
+                                      <button title="Editar" aria-label="editar" onClick={()=> { setExpenseToEdit(e); setShowExpenseModal(true); }} className="w-7 h-7 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-blue-50 hover:border-blue-200 transition text-blue-600 font-semibold">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-blue-600">
+                                          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                        </svg>
+                                      </button>
+                                      <button title="Eliminar" aria-label="eliminar" onClick={()=> deleteExpense(e.id)} className="w-7 h-7 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-rose-50 hover:border-rose-200 transition text-rose-600 font-semibold">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-rose-600">
+                                          <path d="M18 6L6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                          <path d="M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                        </svg>
+                                      </button>
+                                      {normalizeKind(e.kind) === 'CREDITOS' && (
+                                        <button title="Abonar crédito" aria-label="abonar-credito" onClick={()=> openCreditAbono(e)} className="w-7 h-7 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-amber-200 hover:bg-amber-50 hover:border-amber-300 transition text-amber-700 font-semibold">
+                                          $
+                                        </button>
+                                      )}
+                                      {normalizeKind(e.kind) !== 'CREDITOS' && <span aria-hidden className="w-7 h-7 flex-shrink-0" />}
                                     </div>
                                   </td>
-                                  <td className={`px-3 py-2 align-middle text-right text-sm whitespace-nowrap ${e.paid ? 'text-emerald-800' : ''}`}>{fmtMoney(e.amount)}</td>
-                                <td className="px-4 py-3 align-middle text-center overflow-hidden">
-                                  <div className="flex items-center justify-center gap-2 whitespace-nowrap">
-                                    <button title={"Pago"} aria-label="marcar-pagado" onClick={()=> toggleExpensePaid(e.id)} className={("w-7 h-7 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 "+(e.paid ? "bg-green-100 border-green-300":"bg-white border-slate-300"))}>
-                                      {e.paid ? (
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-green-700">
-                                          <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                        </svg>
-                                      ) : (
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-slate-700">
-                                          <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                        </svg>
-                                      )}
-                                    </button>
-
-                                    <button title="Eliminar" aria-label="eliminar" onClick={()=> deleteExpense(e.id)} className="w-7 h-7 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-rose-50 hover:border-rose-200 transition text-rose-600 font-semibold">
-                                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-rose-600">
-                                        <path d="M18 6L6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                        <path d="M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                      </svg>
-                                    </button>
-                                  </div>
+                                </tr>
+                              ))}
+                              {items.length===0 && (
+                                <tr>
+                                  <td colSpan={3} className="px-4 py-3 text-sm opacity-60">No hay registros en esta categoría.</td>
+                                </tr>
+                              )}
+                            </tbody>
+                            <tfoot>
+                              <tr className="text-sm font-semibold bg-slate-50">
+                                <td className="px-4 py-2">Total</td>
+                                <td className={`px-4 py-2 text-right`}>
+                                  {isCredits ? (
+                                    <span>{fmtMoney(total)}</span>
+                                  ) : (
+                                    <span>{fmtMoney(total)}</span>
+                                  )}
+                                </td>
+                                <td className="px-4 py-2 text-center">
+                                  {isCredits ? <span className="text-sm font-semibold text-indigo-700">{fmtMoney(totalCreditsRemaining)}</span> : null}
                                 </td>
                               </tr>
-                            ))}
-                            {items.length===0 && (
-                              <tr>
-                                <td colSpan={3} className="px-4 py-3 text-sm opacity-60">No hay registros en esta categoría.</td>
-                              </tr>
+                            </tfoot>
+                          </table>
+                        </div>
+
+                        <div className="md:hidden bg-white space-y-2 p-3">
+                          {items.map(e => (
+                            <div key={e.id} className={`rounded-lg border p-3 flex flex-col ${e.status === 'paid' ? 'bg-emerald-50 border-emerald-200' : e.status === 'saved' ? 'bg-amber-50 border-amber-200' : 'bg-white border-slate-200'}`}>
+                              <div className="flex items-start justify-between mb-2">
+                                <div className="flex-1 min-w-0">
+                                  <div className={`font-semibold text-sm truncate ${e.status === 'paid' ? 'text-emerald-800' : e.status === 'saved' ? 'text-amber-800' : ''}`}>{e.concept}</div>
+                                  {(e.cutoffDate || e.info || normalizeKind(e.kind) === 'CREDITOS') && (
+                                    <div className={`text-xs opacity-60 mt-1 leading-snug ${e.status === 'paid' ? 'text-emerald-700' : e.status === 'saved' ? 'text-amber-700' : ''}`}>
+                                      {e.cutoffDate && <div>{formatTextDate(e.cutoffDate)}</div>}
+                                      {(e.info || normalizeKind(e.kind) === 'CREDITOS') && (
+                                        <div className="whitespace-nowrap overflow-hidden text-ellipsis">
+                                          {normalizeKind(e.kind) === 'CREDITOS'
+                                            ? `${e.info || ''}${e.info ? ' - ' : ''}Faltan: ${fmtMoney(getCreditRemaining(e))}`
+                                            : (e.info || '')}
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                              <div className="flex items-center justify-between">
+                                <div className={`text-lg font-bold ${e.status === 'paid' ? 'text-emerald-700' : e.status === 'saved' ? 'text-amber-700' : ''}`}>{fmtMoney(e.amount)}</div>
+                                <div className="flex gap-1.5">
+                                  <button title={e.status === 'paid' ? "Pagado" : e.status === 'saved' ? "Dinero Guardado" : "Pendiente"} aria-label="cambiar-estado" onClick={()=> cycleExpenseStatus(e.id)} className={`w-6 h-6 rounded-lg border flex items-center justify-center p-0.5 flex-shrink-0 text-xs transition ${e.status === 'paid' ? "bg-green-100 border-green-300" : e.status === 'saved' ? "bg-amber-100 border-amber-300" : "bg-slate-100 border-slate-300"}`}>
+                                    {e.status === 'paid' ? (
+                                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-green-700">
+                                        <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                      </svg>
+                                    ) : e.status === 'saved' ? (
+                                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-amber-700">
+                                        <path d="M12 2L4 6v6c0 5 8 7 8 7s8-2 8-7V6l-8-4z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                                      </svg>
+                                    ) : (
+                                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-slate-700">
+                                        <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                      </svg>
+                                    )}
+                                  </button>
+                                  <button title="Editar" aria-label="editar" onClick={()=> { setExpenseToEdit(e); setShowExpenseModal(true); }} className="w-6 h-6 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-blue-50 hover:border-blue-200 transition text-blue-600">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-blue-600">
+                                      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                    </svg>
+                                  </button>
+                                  <button title="Eliminar" aria-label="eliminar" onClick={()=> deleteExpense(e.id)} className="w-6 h-6 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-slate-200 hover:bg-rose-50 hover:border-rose-200 transition text-rose-600">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden className="text-rose-600">
+                                      <path d="M18 6L6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                      <path d="M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                    </svg>
+                                  </button>
+                                  {normalizeKind(e.kind) === 'CREDITOS' && (
+                                    <button title="Abonar crédito" aria-label="abonar-credito" onClick={()=> openCreditAbono(e)} className="w-6 h-6 rounded-lg border bg-white flex items-center justify-center flex-shrink-0 border-amber-200 hover:bg-amber-50 hover:border-amber-300 transition text-amber-700 text-[10px]">
+                                      $
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                          {items.length===0 && (
+                            <div className="px-3 py-2 text-sm opacity-60 text-center">No hay registros en esta categoría.</div>
+                          )}
+                          <div className="border-t border-slate-200 pt-3 mt-3">
+                            <div className="flex items-center justify-between text-sm font-semibold">
+                              {isCredits ? (
+                                <>
+                                  <span>Mensual</span>
+                                  <span>{fmtMoney(total)}</span>
+                                </>
+                              ) : (
+                                <>
+                                  <span>Total</span>
+                                  <span>{fmtMoney(total)}</span>
+                                </>
+                              )}
+                            </div>
+                            {isCredits && (
+                              <div className="mt-1 text-center text-sm font-semibold text-indigo-700">{fmtMoney(totalCreditsRemaining)}</div>
                             )}
-                          </tbody>
-                          <tfoot>
-                            <tr className="text-sm font-semibold bg-slate-50">
-                              <td className="px-4 py-2">Total</td>
-                              <td className="px-4 py-2 text-right">{fmtMoney(total)}</td>
-                              <td className="px-4 py-2" />
-                            </tr>
-                          </tfoot>
-                        </table>
-                      </div>
+                          </div>
+                        </div>
                     </div>
                   );
                 };
@@ -589,9 +1562,37 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
               })()}
             </div>
           </div>
-          
         </section>
       </main>
+
+      {showCreditAbonoModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl p-6 shadow-[0_12px_28px_rgba(0,0,0,0.18)]">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xl font-bold">Abonar a Crédito</h3>
+              <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={()=> setShowCreditAbonoModal(false)}>Cerrar</button>
+            </div>
+            <div className="space-y-3">
+              <label className="block text-sm">
+                <div className="mb-1">Valor del abono extra</div>
+                <input type="number" className="w-full rounded-lg border border-slate-300 px-3 py-2" value={creditAbonoAmount} onChange={e=> setCreditAbonoAmount(e.target.value.replace(/[^\d]/g, ''))} />
+              </label>
+              <label className="block text-sm">
+                <div className="mb-1">Estrategia (bola de nieve)</div>
+                <select className="w-full rounded-lg border border-slate-300 px-3 py-2" value={creditAbonoMode} onChange={e=> setCreditAbonoMode(e.target.value)}>
+                  <option value="cuotas">Reducir cantidad de cuotas</option>
+                  <option value="valor">Reducir valor de cuotas futuras</option>
+                </select>
+              </label>
+              <p className="text-xs opacity-70">Este abono se aplica al credito seleccionado sin borrar historial.</p>
+            </div>
+            <div className="flex justify-end gap-2 mt-4">
+              <button className="px-4 py-2 rounded-lg border border-slate-300" onClick={()=> setShowCreditAbonoModal(false)}>Cancelar</button>
+              <button className="px-4 py-2 rounded-lg bg-slate-900 text-white" onClick={applyCreditAbono}>Aplicar abono</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {detailDate && <DayDetailModal date={detailDate} onClose={()=> setDetailDate(null)} user={user} dayTypes={user.dayTypes} onAddWork={(p)=> addWorkDay(p)} onDeleteWork={(id)=> deleteWorkDay(id)} />}
 
@@ -636,13 +1637,54 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
           <div className="w-full max-w-md bg-white rounded-2xl p-6 shadow-[0_12px_28px_rgba(0,0,0,0.18)]">
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-xl font-bold">Agregar Gasto</h3>
-              <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={()=> setShowExpenseModal(false)}>Cerrar</button>
+              <h3 className="text-xl font-bold">{expenseToEdit ? 'Editar Gasto' : 'Agregar Gasto'}</h3>
+              <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={()=> { setShowExpenseModal(false); setExpenseToEdit(null); }}>Cerrar</button>
             </div>
-            <RegisterExpense onSubmit={(f)=> { addExpense(f); setShowExpenseModal(false); }} onClose={()=> setShowExpenseModal(false)} />
+            <RegisterExpense 
+              initialData={expenseToEdit}
+              onSubmit={(f)=> { 
+                if (expenseToEdit) {
+                  editExpense(expenseToEdit.id, f);
+                } else {
+                  addExpense(f); 
+                }
+                setShowExpenseModal(false); 
+                setExpenseToEdit(null);
+              }} 
+              onClose={()=> { setShowExpenseModal(false); setExpenseToEdit(null); }} 
+            />
           </div>
         </div>
       )}
+
+      {showLoanModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="w-full max-w-3xl bg-white rounded-2xl p-6 shadow-[0_12px_28px_rgba(0,0,0,0.18)]">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xl font-bold">{loanProfiles.find(p => p.id === selectedLoanProfileId)?.name ? `Préstamo - ${loanProfiles.find(p => p.id === selectedLoanProfileId)?.name}` : 'Préstamo'}</h3>
+              <button className="px-3 py-1 rounded-lg border border-slate-300" onClick={()=> setShowLoanModal(false)}>Cerrar</button>
+            </div>
+            <LoanProfilesManager
+              profiles={loanProfiles}
+              selectedProfileId={selectedLoanProfileId}
+              onAddEntry={addLoanEntry}
+              onAbonar={abonarLoanProfile}
+              onDeleteEntry={deleteLoanEntry}
+            />
+          </div>
+        </div>
+      )}
+
+      <LobitoAdvisor
+        logo={logoSrc}
+        isVisible={showLobito}
+        onShow={()=> setShowLobito(true)}
+        onHide={()=> setShowLobito(false)}
+        currentMonth={currentMonth}
+        tips={lobitoInsights.tips}
+        snowballTarget={lobitoInsights.snowballTarget}
+        totalDebt={lobitoInsights.totalDebt}
+      />
 
       <footer className="max-w-6xl mx-auto mt-10 text-xs opacity-60">Local-first • Guarda en tu dispositivo.</footer>
     </div>
@@ -650,23 +1692,141 @@ function MainApp({ user, replaceUser, patchCurrentUser, onLogout, goProfile }){
 }
 
 // ------------------ UI Components ------------------
+function LobitoAdvisor({ logo, isVisible, onShow, onHide, currentMonth, tips, snowballTarget, totalDebt }){
+  const [activeTip, setActiveTip] = useState('');
+  const tipQueueRef = useRef([]);
+
+  const variedTips = useMemo(() => buildVariedLobitoTips({
+    tips,
+    snowballTarget,
+    totalDebt,
+    currentMonth,
+  }), [tips, snowballTarget, totalDebt, currentMonth]);
+
+  function nextTip(){
+    if(!variedTips.length){
+      setActiveTip('Registra tus gastos y movimientos para que pueda darte consejos más precisos.');
+      return;
+    }
+
+    if(tipQueueRef.current.length === 0){
+      const shuffled = shuffleArray(variedTips);
+      if(shuffled.length > 1 && shuffled[0] === activeTip){
+        const moved = shuffled.shift();
+        shuffled.push(moved);
+      }
+      tipQueueRef.current = shuffled;
+    }
+
+    const next = tipQueueRef.current.shift();
+    if(next) setActiveTip(next);
+  }
+
+  useEffect(() => {
+    if(!isVisible) return;
+    const id = setInterval(() => {
+      nextTip();
+    }, 300000);
+    return () => clearInterval(id);
+  }, [isVisible, variedTips, activeTip]);
+
+  useEffect(() => {
+    tipQueueRef.current = [];
+    setActiveTip('');
+    if(isVisible) nextTip();
+  }, [currentMonth, isVisible, variedTips]);
+
+  const safeActiveTip = activeTip || 'Registra tus gastos y movimientos para que pueda darte consejos más precisos.';
+
+  if(!isVisible){
+    return (
+      <button
+        type="button"
+        onClick={onShow}
+        className="lobito-fab fixed right-4 bottom-4 md:right-8 md:bottom-8 z-40"
+        aria-label="Mostrar lobito financiero"
+      >
+        <img src={logo} alt="Lobito asesor" className="lobito-logo-sticker w-14 h-14 object-contain" />
+      </button>
+      );
+  }
+
+  return (
+    <div className="fixed right-4 bottom-4 md:right-8 md:bottom-8 z-40">
+      <div className="lobito-stack flex items-end gap-2 md:gap-3">
+        <div className="lobito-column space-y-2">
+          <div className="lobito-bubble lobito-bubble-snow">
+            <div className="lobito-bubble-title">Bola de Nieve Recomendada</div>
+            {snowballTarget ? (
+              <>
+                <div className="lobito-bubble-strong">{snowballTarget.name}</div>
+                <div className="lobito-bubble-meta">Saldo pendiente: {fmtMoney(snowballTarget.amount)}</div>
+                <div className="lobito-bubble-meta">Deuda total activa: {fmtMoney(totalDebt)}</div>
+              </>
+            ) : (
+              <div className="lobito-bubble-meta">No hay deudas activas detectadas.</div>
+            )}
+          </div>
+
+          <div className="lobito-bubble lobito-bubble-tip">
+            <div className="lobito-bubble-title">Consejo del Lobito • {monthLabel(currentMonth)}</div>
+            <p className="lobito-bubble-text">{safeActiveTip}</p>
+            <div className="lobito-bubble-actions">
+              <button className="lobito-link-btn" onClick={nextTip}>Otro consejo</button>
+              <button
+                className="lobito-link-btn"
+                onClick={() => {
+                  tipQueueRef.current = [];
+                  nextTip();
+                }}
+              >
+                Variar
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <button type="button" onClick={onHide} className="lobito-fab" aria-label="Ocultar lobito financiero">
+          <img src={logo} alt="Lobito" className="lobito-logo-sticker lobito-avatar w-14 h-14 object-contain" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function CalendarCell({ date, month, user, onOpenDetail }){
   if(!date) return <div className="h-20 rounded-xl border bg-white/40" />;
   const isOtherMonth = date.getMonth() !== month;
   const key = ymd(date);
+  const todayKey = ymd(new Date());
+  const isToday = key === todayKey;
   const workDays = user.workDays.filter(w => w.date === key);
   const indicators = [];
   workDays.forEach(w => { const t = user.dayTypes.find(dt => dt.id === w.typeId); if(t && !indicators.includes(t.color)) indicators.push(t.color); });
   const showIndicators = indicators.slice(0,4);
   const dayIncome = workDays.reduce((acc,w)=> { const t = user.dayTypes.find(dt => dt.id === w.typeId); return acc + (t ? t.rate : (w.value||0)); }, 0);
+
+  const cellClass = [
+    'h-20 rounded-xl border bg-white p-2 flex flex-col justify-between cursor-pointer shadow-sm transition',
+    isOtherMonth ? 'opacity-40' : '',
+    isToday
+      ? 'border-blue-500 ring-2 ring-blue-400/60 bg-blue-50/70 hover:border-blue-500'
+      : 'hover:shadow-md hover:border-slate-400'
+  ].join(' ');
+
   return (
-    <div role="button" tabIndex={0} onKeyDown={(e)=> { if(e.key==='Enter'||e.key===' ') onOpenDetail(key); }} onClick={()=> onOpenDetail(key)} className={`h-20 rounded-xl border bg-white p-2 flex flex-col justify-between ${isOtherMonth? 'opacity-40':''} cursor-pointer shadow-sm`}>
+    <div role="button" tabIndex={0} onKeyDown={(e)=> { if(e.key==='Enter'||e.key===' ') onOpenDetail(key); }} onClick={()=> onOpenDetail(key)} className={cellClass}>
       <div className="flex items-center justify-between">
-        <div className="text-xs font-semibold">{date.getDate()}</div>
-        <div className="flex gap-1">{showIndicators.map((c,i)=> <span key={i} className="w-3 h-3 rounded-sm border" style={{ background: c }} />)}</div>
+        <div className="text-xs font-semibold flex items-center gap-1.5">
+          <span>{date.getDate()}</span>
+          {isToday && <span className="px-1.5 py-0.5 rounded-full text-[9px] leading-none font-bold bg-blue-600 text-white">Hoy</span>}
+        </div>
+        <div className="flex gap-1">{showIndicators.map((c,i)=> <span key={i} className="w-3 h-3 rounded-sm border border-slate-200" style={{ background: c }} />)}</div>
       </div>
       <div className="flex items-end justify-between">
-        {dayIncome>0 ? <div className="text-[11px] font-semibold">{fmtMoney(dayIncome)}</div> : <div className="text-[11px] opacity-50"> </div>}
+        {dayIncome>0 ? (
+          <div className="text-[10px] font-semibold opacity-60">{fmtMoneyCompact(dayIncome)}</div>
+        ) : <div className="text-xs opacity-50"> </div>}
         <div className="text-xs opacity-60">&nbsp;</div>
       </div>
     </div>
@@ -685,7 +1845,7 @@ function DayDetailModal({ date, onClose, user, dayTypes, onAddWork, onDeleteWork
       <div className="w-full max-w-3xl bg-white rounded-2xl p-4 shadow-lg">
         <div className="flex items-center justify-between mb-3">
           <div>
-            <div className="text-sm opacity-70">Detalle – {new Date(date).toLocaleDateString('es-CO', { weekday:'long', day:'numeric', month:'long', year:'numeric' })}</div>
+            <div className="text-sm opacity-70">Detalle – {parseYmdLocal(date).toLocaleDateString('es-CO', { weekday:'long', day:'numeric', month:'long', year:'numeric' })}</div>
             <div className="text-xs opacity-50">Trabajos del día</div>
           </div>
           <div className="flex gap-2"><button className="px-3 py-1 rounded-lg border border-slate-300" onClick={onClose}>Cerrar</button></div>
@@ -746,75 +1906,207 @@ function DayDetailModal({ date, onClose, user, dayTypes, onAddWork, onDeleteWork
   );
 }
 
-function RegisterExpense({ onSubmit, onClose }){
-  const [form,setForm]=useState({ concept:'', amount:'', kind:'GASTOS FIJOS', recurring:false });
+function RegisterExpense({ onSubmit, onClose, initialData }){
+  // Inicializa el formulario, adaptando gastos antiguos si es necesario
+  const [form, setForm] = useState(() => {
+    if (initialData) {
+      return {
+        ...initialData,
+        recurrenceType: initialData.recurring ? 'siempre' : 'ninguna',
+        installments: 2 // Valor por defecto en caso de cambiar a cuotas
+      };
+    }
+    return { concept:'', amount:'', kind:'GASTOS FIJOS', recurrenceType:'ninguna', installments: 2, info:'', cutoffDate:'' };
+  });
+  
+  const isEditing = !!initialData;
+
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-[0_8px_24px_rgba(0,0,0,0.06)]">
-      <div className="text-lg font-bold mb-2">Registrar gastos</div>
       <div className="space-y-3 text-sm">
-        <input type="text" placeholder="Concepto" className="w-full rounded-lg border border-slate-300 px-3 py-2" value={form.concept} onChange={e=> setForm({...form, concept: e.target.value})} />
-        <input type="number" placeholder="Valor" className="w-full rounded-lg border border-slate-300 px-3 py-2" value={form.amount} onChange={e=> setForm({...form, amount: e.target.value})} />
-        <select className="w-full rounded-lg border border-slate-300 px-3 py-2" value={form.kind} onChange={e=> setForm({...form, kind: e.target.value})}>
+        <input type="text" placeholder="Concepto (Ej. Internet, Netflix)" className="w-full rounded-lg border border-slate-300 px-3 py-2" value={form.concept} onChange={e=> setForm({...form, concept: e.target.value})} />
+        
+        <div className="grid grid-cols-2 gap-2">
+          <label className="block text-xs">
+            <span className="opacity-70 mb-1 block">Fecha de corte</span>
+            <input type="date" className="w-full rounded-lg border border-slate-300 px-3 py-2" value={form.cutoffDate || ''} onChange={e=> setForm({...form, cutoffDate: e.target.value})} />
+          </label>
+          <label className="block text-xs">
+            <span className="opacity-70 mb-1 block">Valor</span>
+            <input type="number" placeholder="Ej. 50000" className="w-full rounded-lg border border-slate-300 px-3 py-2" value={form.amount} onChange={e=> setForm({...form, amount: e.target.value.replace(/[^\d]/g, '')})} />
+          </label>
+        </div>
+
+        <input type="text" placeholder="Información adicional (opcional)" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs" value={form.info || ''} onChange={e=> setForm({...form, info: e.target.value})} />
+        
+        <select className="w-full rounded-lg border border-slate-300 px-3 pr-10 py-2" value={form.kind} onChange={e=> setForm({...form, kind: e.target.value})}>
           <option value="CREDITOS">CREDITOS</option>
           <option value="GASTOS FIJOS">GASTOS FIJOS</option>
           <option value="SUSCRIPCIONES">SUSCRIPCIONES</option>
         </select>
 
-        <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={form.recurring} onChange={e=> setForm({...form, recurring: e.target.checked})} /> Recurrente (se copiará a próximos meses)
-        </label>
+        <div className="rounded-lg bg-slate-50 p-3 border border-slate-200">
+          <label className="block text-xs font-semibold mb-2">Recurrencia del pago</label>
+          <select className="w-full rounded-lg border border-slate-300 px-3 pr-10 py-2 mb-2" value={form.recurrenceType} onChange={e=> setForm({...form, recurrenceType: e.target.value})} disabled={isEditing}>
+            <option value="ninguna">Solo este mes</option>
+            <option value="siempre">Suscripción Mensual (Siempre)</option>
+            <option value="cuotas">Pago a Cuotas</option>
+          </select>
+          
+          {form.recurrenceType === 'cuotas' && !isEditing && (
+             <label className="block text-xs">
+               <span className="opacity-70 mb-1 block">Número de cuotas en total</span>
+               <input type="number" min="2" max="72" className="w-full rounded-lg border border-slate-300 px-3 py-2" value={form.installments} onChange={e=> setForm({...form, installments: Number(e.target.value)})} />
+             </label>
+          )}
+          {isEditing && <p className="text-[10px] opacity-60 mt-1">El tipo de recurrencia no se puede cambiar al editar.</p>}
+        </div>
 
-        <div className="flex gap-2">
-          <button className="flex-1 bg-slate-900 text-white rounded-xl py-2.5 font-semibold" onClick={()=> { if(!form.concept||!form.amount) return alert('Completa el concepto y el valor'); onSubmit(form); setForm({ concept:'', amount:'', kind:form.kind, recurring:form.recurring }); if(typeof onClose === 'function') onClose(); }}>Registrar gasto</button>
+        <div className="flex gap-2 pt-2">
+          <button className="flex-1 bg-slate-900 text-white rounded-xl py-2.5 font-semibold" onClick={()=> { 
+            if(!form.concept||!form.amount) return alert('Completa el concepto y el valor'); 
+            onSubmit({ ...form, amount: sanitizeAmount(form.amount) }); 
+          }}>
+            {isEditing ? 'Guardar Cambios' : 'Registrar gasto'}
+          </button>
         </div>
       </div>
     </div>
   );
 }
 
-function LoanPanel({ loans, onAdd, onToggle, onDelete, onAbonar }){
-  const [form, setForm]=useState({ person:'', amount:'' });
-  const [abonos, setAbonos] = useState({}); // {loanId: value}
-  useEffect(()=> { // reset abonos when loans change
-    const map = {};
-    loans.forEach(l => map[l.id] = '');
-    setAbonos(map);
-  }, [loans]);
+function LoanProfilesSummary({ profiles, onOpenProfile, onCreateProfile, onDeleteProfile }){
+  const profileTotal = (p) => (p.entries || []).reduce((a,b)=> a + (Number(b.amount) || 0), 0);
+  const allTotal = profiles.reduce((sum, p) => sum + profileTotal(p), 0);
 
-  const totalOpen = loans.filter(l=>!l.settled).reduce((a,b)=> a + b.amount, 0);
   return (
     <div className="space-y-3 text-sm">
-      <div className="flex gap-2">
-        <input type="text" placeholder="Persona" className="flex-1 rounded-lg border border-slate-300 px-3 py-2" value={form.person} onChange={e=> setForm({...form, person: e.target.value})} />
-        <input type="number" placeholder="Monto" className="w-32 rounded-lg border border-slate-300 px-3 py-2" value={form.amount} onChange={e=> setForm({...form, amount: e.target.value})} />
-        <button className="rounded-xl bg-slate-900 text-white px-3 font-semibold" onClick={()=> { if(!form.person||!form.amount) return alert('Completa los campos'); onAdd({ person: form.person, amount: form.amount }); setForm({ person:'', amount:'' }); }}>Agregar</button>
+      <div className="text-xs opacity-70">Total de todos los perfiles: <span className="font-semibold">{fmtMoney(allTotal)}</span></div>
+
+      {profiles.length === 0 && <div className="text-xs opacity-60">No hay perfiles de préstamo todavía.</div>}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <button className="rounded-xl border border-dashed border-slate-300 p-3 bg-slate-50 hover:bg-slate-100 text-left transition" onClick={onCreateProfile}>
+          <div className="font-semibold text-slate-800">Crear perfil</div>
+          <div className="text-xs opacity-60 mt-1">Haz clic para registrar un nuevo perfil.</div>
+        </button>
+
+        {profiles.map(p => {
+          const entries = p.entries || [];
+          const lastDate = entries.length ? entries[0].date : '';
+          return (
+            <button key={p.id} className="rounded-xl border border-slate-200 p-3 bg-white hover:border-slate-400 hover:bg-slate-50 text-left transition" onClick={()=> onOpenProfile(p.id)}>
+              <div className="flex items-start justify-between gap-2">
+                <div className="font-semibold truncate">{p.name}</div>
+                <div className="flex items-center gap-2">
+                  <div className="text-sm font-bold text-slate-800 whitespace-nowrap">{fmtMoney(profileTotal(p))}</div>
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    className="text-xs px-2 py-0.5 rounded border border-rose-300 text-rose-600 hover:bg-rose-50"
+                    onClick={(ev)=> { ev.preventDefault(); ev.stopPropagation(); onDeleteProfile?.(p.id); }}
+                    onKeyDown={(ev)=> {
+                      if(ev.key === 'Enter' || ev.key === ' '){
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        onDeleteProfile?.(p.id);
+                      }
+                    }}
+                  >
+                    Borrar
+                  </span>
+                </div>
+              </div>
+              <div className="text-xs opacity-60 mt-1">{entries.length} movimientos</div>
+              <div className="text-xs opacity-60">{lastDate ? `Último: ${parseYmdLocal(lastDate).toLocaleDateString('es-CO')}` : 'Sin movimientos'}</div>
+            </button>
+          );
+        })}
       </div>
+    </div>
+  );
+}
 
-      <div className="text-xs opacity-70">Total abierto: <span className="font-semibold">{fmtMoney(totalOpen)}</span></div>
+function LoanProfilesManager({ profiles, selectedProfileId, onAddEntry, onAbonar, onDeleteEntry }){
+  const [entryForm, setEntryForm] = useState({ amount:'', date: ymd(new Date()), concept:'' });
+  const [abonoForm, setAbonoForm] = useState({ amount:'', date: ymd(new Date()), concept:'Abono' });
 
-      <ul className="space-y-2">
-        {loans.length===0 && <li className="opacity-60">No hay préstamos.</li>}
-        {loans.slice().sort((a,b)=> b.amount - a.amount).map(l=> (
-          <li key={l.id} className="rounded-xl border border-slate-200 p-3 flex items-center justify-between bg-white">
-            <div>
-              <div className="font-semibold">{l.person}</div>
-              <div className="text-xs opacity-60">{new Date(l.date).toLocaleDateString('es-CO')}</div>
-            </div>
+  const selected = profiles.find(p => p.id === selectedProfileId) || null;
+  const selectedEntries = (selected?.entries || []).slice().sort((a,b)=> b.date.localeCompare(a.date));
+  const selectedTotal = selectedEntries.reduce((a,b)=> a + (Number(b.amount) || 0), 0);
 
-            <div className="flex items-center gap-3">
-              <div className="font-semibold w-28 text-right">{fmtMoney(l.amount)}</div>
+  return (
+    <div className="space-y-4 text-sm max-h-[70vh] overflow-y-auto">
+      <div className="space-y-3">
+        <div className="rounded-xl border border-slate-200 p-3 bg-white">
+          <div className="flex items-center justify-between mb-3">
+            <div className="font-semibold">{selected ? `Movimientos de ${selected.name}` : 'Movimientos'}</div>
+            <div className="text-sm font-bold">{fmtMoney(selectedTotal)}</div>
+          </div>
 
-              <div className="flex items-center gap-2">
-                <input type="number" placeholder="Abonar" value={abonos[l.id] || ''} onChange={e=> setAbonos(s => ({ ...s, [l.id]: e.target.value }))} className="w-24 rounded-lg border border-slate-300 px-2 py-1 text-sm" />
-                <button className="text-xs px-3 py-1 rounded-lg border bg-white" onClick={()=> { if(!onAbonar) return; const val = Number(abonos[l.id]||0); if(!val) return alert('Ingresa un valor para abonar'); onAbonar(l.id, val); }}>Abonar</button>
+          {!selected && <div className="text-xs opacity-60">Vuelve al dashboard y abre un perfil haciendo clic en su tarjeta.</div>}
 
-                <button className={"text-xs px-3 py-1 rounded-lg border "+(l.settled ? 'bg-green-100 border-green-300' : 'bg-white')} onClick={()=> onToggle(l.id)}>{l.settled ? 'Saldado' : 'Marcar saldado'}</button>
-                <button className="text-xs px-3 py-1 rounded-lg border bg-white" onClick={()=> onDelete(l.id)}>Eliminar</button>
+          {selected && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 auto-rows-max">
+              <div className="space-y-3">
+                <div className="rounded-lg border border-slate-200 p-3 bg-slate-50">
+                  <div className="text-xs font-semibold mb-2">Agregar nuevo préstamo</div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    <input type="text" className="rounded-lg border border-slate-300 px-3 py-2 md:col-span-1 text-sm" placeholder="Concepto" value={entryForm.concept} onChange={e=> setEntryForm(f => ({ ...f, concept: e.target.value }))} />
+                    <input type="number" className="rounded-lg border border-slate-300 px-3 py-2 md:col-span-1 text-sm" placeholder="Monto" value={entryForm.amount} onChange={e=> setEntryForm(f => ({ ...f, amount: e.target.value.replace(/[^\d]/g, '') }))} />
+                    <input type="date" className="rounded-lg border border-slate-300 px-3 py-2 md:col-span-2 text-sm" value={entryForm.date} onChange={e=> setEntryForm(f => ({ ...f, date: e.target.value }))} />
+                  </div>
+                  <div className="mt-2 flex justify-end">
+                    <button className="px-3 py-2 rounded-lg bg-slate-900 text-white font-semibold text-sm hover:bg-slate-800" onClick={()=> {
+                      if(!entryForm.amount) return alert('Ingresa un monto.');
+                      onAddEntry({ profileId: selected.id, ...entryForm });
+                      setEntryForm(f => ({ ...f, amount: '', concept: '' }));
+                    }}>Guardar préstamo</button>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-emerald-200 p-3 bg-emerald-50">
+                  <div className="text-xs font-semibold mb-2 text-emerald-800">Abonar a este perfil</div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    <input type="text" className="rounded-lg border border-emerald-300 px-3 py-2 md:col-span-1 text-sm" placeholder="Concepto del abono" value={abonoForm.concept} onChange={e=> setAbonoForm(f => ({ ...f, concept: e.target.value }))} />
+                    <input type="number" className="rounded-lg border border-emerald-300 px-3 py-2 md:col-span-1 text-sm" placeholder="Valor del abono" value={abonoForm.amount} onChange={e=> setAbonoForm(f => ({ ...f, amount: e.target.value.replace(/[^\d]/g, '') }))} />
+                    <input type="date" className="rounded-lg border border-emerald-300 px-3 py-2 md:col-span-2 text-sm" value={abonoForm.date} onChange={e=> setAbonoForm(f => ({ ...f, date: e.target.value }))} />
+                  </div>
+                  <div className="mt-2 flex justify-end">
+                    <button className="px-3 py-2 rounded-lg bg-emerald-700 text-white font-semibold text-sm hover:bg-emerald-800" onClick={()=> {
+                      if(!abonoForm.amount) return alert('Ingresa un valor de abono.');
+                      onAbonar({ profileId: selected.id, ...abonoForm });
+                      setAbonoForm(f => ({ ...f, amount: '', concept: f.concept || 'Abono' }));
+                    }}>Registrar abono</button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 p-3 bg-white">
+                <div className="text-xs font-semibold mb-3">Historial de movimientos</div>
+                {selectedEntries.length === 0 && <div className="text-xs opacity-60 text-center py-4">Este perfil no tiene movimientos aún.</div>}
+
+                {selectedEntries.length > 0 && (
+                  <div className="space-y-2 max-h-[300px] overflow-y-auto pr-2">
+                    {selectedEntries.map(e => (
+                      <div key={e.id} className="rounded-lg border border-slate-200 p-3 flex items-center justify-between bg-slate-50 hover:bg-slate-100 transition">
+                        <div className="flex-1 min-w-0">
+                          <div className="font-semibold text-sm truncate">{e.concept || 'Sin concepto'}</div>
+                          <div className="text-xs opacity-60 mt-0.5">{parseYmdLocal(e.date).toLocaleDateString('es-CO')}</div>
+                        </div>
+                        <div className="flex items-center gap-3 ml-2 flex-shrink-0">
+                          <div className={`font-bold text-sm whitespace-nowrap ${e.amount < 0 ? 'text-emerald-700' : 'text-slate-900'}`}>{fmtMoney(e.amount)}</div>
+                          <button className="text-xs px-2 py-1.5 rounded-lg border border-rose-300 bg-rose-50 text-rose-600 hover:bg-rose-100 font-medium transition" onClick={()=> onDeleteEntry(selected.id, e.id)}>✕</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
-          </li>
-        ))}
-      </ul>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
